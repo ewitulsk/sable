@@ -94,6 +94,7 @@ fn prepare(registry:&Registry,scene:i64,ids:&[i64],values:&[f64],witness_id:i64)
             if support_count>MAX_CANDIDATES||support_primitives>MAX_PRIMITIVES{return Err("character support query cap".into());}
             if let Some(contact)=rapier3d_f64::parry::query::contact(current.position(),current.shape(),support.position(),support.shape(),prediction).map_err(|_|"unsupported character support shape")?{
                 let response=(linear_per_impulse+angular_per_impulse.cross(contact.point1-body.center_of_mass())).dot(contact.normal1);
+                if ids[6]>=80&&ids[6]<=84 {eprintln!("CHAR_SUPPORT seq={} J={} response={} dist={} normal={:?} point={:?}",ids[6],impulse,response,contact.dist,contact.normal1,contact.point1);}
                 if response>1e-9{
                     let support_velocity=support.parent().map_or(Vec3::ZERO,|p|region.sim.rigid_body_set[p].velocity_at_point(contact.point2));
                     let closing=(body.velocity_at_point(contact.point1)-support_velocity).dot(contact.normal1);
