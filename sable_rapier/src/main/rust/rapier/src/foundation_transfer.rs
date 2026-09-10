@@ -74,12 +74,12 @@ pub(super) fn retire_scene(registry:&mut Registry,scene:i64) {
     }
 }
 
-fn lookup<'a>(registry:&'a Registry,id:i64)->Result<&'a Region,String> {
+pub(super) fn lookup<'a>(registry:&'a Registry,id:i64)->Result<&'a Region,String> {
     let scene=registry.scenes.get(&id).ok_or("stale scene handle")?;
     if scene.failed_range { return Err("failed scene cannot transfer".into()); }
     Ok(scene)
 }
-fn body_lease(region:&Region,ids:&[i64])->Result<RigidBodyHandle,String> {
+pub(super) fn body_lease(region:&Region,ids:&[i64])->Result<RigidBodyHandle,String> {
     if ids.len()!=5 || region.failed_range || region.body_epochs.get(&ids[0])!=Some(&ids[1]) || region.epoch!=ids[4] {
         return Err("failed scene or stale body/frame ownership lease".into());
     }
@@ -101,7 +101,7 @@ fn swept_bounds(body:&RigidBody,collider:&Collider,gravity:Vec3)->(Vec3,Vec3) {
     let halo=Vec3::splat(radius+body.soft_ccd_prediction()+0.05);
     (current.min(queued)-travel-halo,current.max(queued)+travel+halo)
 }
-fn pose(values:&[f64])->Result<Pose,String> {
+pub(super) fn pose(values:&[f64])->Result<Pose,String> {
     let translation=vec(values,0)?;
     if values.len()<7 || values[3..7].iter().any(|v|!v.is_finite()) {return Err("invalid pose rotation".into());}
     let rotation=rapier3d_f64::glamx::DQuat::from_xyzw(values[3],values[4],values[5],values[6]);
@@ -398,6 +398,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
         14 => {
             if ids.len()!=5{return Err("clock initialization requires complete expected scene clock and target time".into());}require(values,0)?;
             if registry.transfer.is_some(){return Err("cannot initialize a scene clock while transfer staging exists".into());}
+            if character::owns_scene(&registry.characters,scene){return Err("character ownership prevents empty-scene clock initialization".into());}
             let region=registry.scenes.get_mut(&scene).ok_or("stale scene")?;
             if region.failed_range || scene!=ids[0] || region.epoch!=ids[1] || region.time_nanos!=ids[2] || region.mutation!=ids[3] {
                 return Err("stale scene clock initialization lease".into());
@@ -413,6 +414,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
             region.time_nanos=ids[4];region.mutation=next_mutation;
             Ok(vec![scene,region.epoch,region.time_nanos,region.mutation])
         },
+        20..=27 => character::dispatch(registry,scene,op,ids,values),
         _=>Err("unknown typed foundation operation".into()),
     }
 }

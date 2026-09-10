@@ -11,6 +11,8 @@ use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[path = "foundation_transfer.rs"]
 mod transfer;
+#[path = "foundation_character.rs"]
+mod character;
 
 const LIMIT: f64 = 512.0;
 const MAX_SECTIONS: usize = 4096;
@@ -146,6 +148,7 @@ struct Registry {
     scenes: HashMap<i64, Region>,
     next_transfer: i64,
     transfer: Option<transfer::PreparedTransfer>,
+    characters: character::State,
 }
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 fn bounded(v: Vec3) -> Result<Vec3, String> {
@@ -344,6 +347,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
             }
             if op == 10 {
                 transfer::retire_scene(&mut registry,handle);
+                character::retire_scene(&mut registry.characters,handle);
                 registry
                     .scenes
                     .remove(&handle)
