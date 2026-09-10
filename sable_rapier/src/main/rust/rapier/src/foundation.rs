@@ -11,6 +11,8 @@ use std::sync::{Mutex, OnceLock};
 
 const LIMIT: f64 = 512.0;
 const MAX_SECTIONS: usize = 4096;
+// Legacy query results carry IDs in doubles. Refuse precision loss until the typed query ABI lands.
+const MAX_EXACT_KEY: i64 = (1_i64 << 53) - 1;
 struct Section {
     revision: i64,
     body: Option<RigidBodyHandle>,
@@ -22,6 +24,8 @@ struct Region {
     bodies: HashMap<i64, RigidBodyHandle>,
     epoch: i64,
     failed_range: bool,
+    streamed_terrain: bool,
+    section_high_water: i64,
 }
 struct Simulation {
     pipeline: PhysicsPipeline,
@@ -225,6 +229,8 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                         bodies: HashMap::new(),
                         epoch: 0,
                         failed_range: false,
+                        streamed_terrain: false,
+                        section_high_water: 0,
                     },
                 );
                 return Ok(vec![id as f64, 1.0]);
@@ -240,7 +246,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 .scenes
                 .get_mut(&handle)
                 .ok_or("stale scene handle")?;
-            if region.failed_range && op != 5 && op != 13 {
+            if region.failed_range && op != 5 && op != 13 && op != 18 {
                 return Err("scene escaped local bounds; inspect and retire it".into());
             }
             if op == 4 {
@@ -258,9 +264,24 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
             {
                 let sim = &mut region.sim;
                 match op {
-                    1 | 2 => {
+                    1 | 2 | 14 | 15 => {
+                        let streamed = op == 14 || op == 15;
+                        let publishing = op == 1 || op == 14;
+                        if streamed && !region.streamed_terrain && !region.sections.is_empty() {
+                            return Err("cannot mix legacy and streamed terrain lifetimes".into());
+                        }
+                        if !streamed && region.streamed_terrain {
+                            return Err("streamed terrain requires lease operations".into());
+                        }
                         if key <= 0 || revision < 0 {
                             return Err("invalid section key/revision".into());
+                        }
+                        if streamed && key > MAX_EXACT_KEY {
+                            return Err("section lease exceeds exact legacy query identity range".into());
+                        }
+                        if streamed && !region.sections.contains_key(&key)
+                            && (!publishing || key <= region.section_high_water) {
+                            return Err("retired or unknown section lease".into());
                         }
                         if region
                             .sections
@@ -274,7 +295,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                         {
                             return Err("section key cap reached".into());
                         }
-                        let translation = if op == 1 {
+                        let translation = if publishing {
                             require(&v, 3)?;
                             let p = vec(&v, 0)?;
                             bounded(p + Vec3::splat(16.))?;
@@ -283,8 +304,11 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             }
                             p
                         } else {
+                            require(&v, 0)?;
                             Vec3::ZERO
                         };
+                        // Validate and prepare before removing the live collider. Failed requests leave it intact.
+                        let shape = if publishing { section_shape(&voxels) } else { None };
                         if let Some(old) = region.sections.remove(&key) {
                             if let Some(h) = old.body {
                                 sim.rigid_body_set.remove(
@@ -302,8 +326,8 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             body: None,
                             collider: None,
                         };
-                        if op == 1 {
-                            if let Some(shape) = section_shape(&voxels) {
+                        if publishing {
+                            if let Some(shape) = shape {
                                 let body = sim
                                     .rigid_body_set
                                     .insert(RigidBodyBuilder::fixed().translation(translation));
@@ -319,7 +343,11 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                                 section.collider = Some(collider);
                             }
                         }
-                        region.sections.insert(key, section);
+                        if streamed {
+                            region.streamed_terrain = true;
+                            region.section_high_water = region.section_high_water.max(key);
+                        }
+                        if op != 15 { region.sections.insert(key, section); }
                         Ok(vec![revision as f64])
                     }
                     3 | 11 => {
@@ -500,6 +528,23 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                         sim.impulse_joint_set.len() as f64,
                         if region.failed_range { 1. } else { 0. },
                     ]),
+                    16 => { require(&v, 0)?; Ok(vec![1.0]) },
+                    17 => {
+                        require(&v, 0)?;
+                        let body = *region.bodies.get(&key).ok_or("unknown body")?;
+                        sim.rigid_body_set.remove(body, &mut sim.island_manager,
+                            &mut sim.collider_set, &mut sim.impulse_joint_set,
+                            &mut sim.multibody_joint_set, true).ok_or("stale body registry")?;
+                        region.bodies.remove(&key);
+                        Ok(vec![])
+                    },
+                    18 => {
+                        require(&v, 0)?;
+                        Ok(vec![region.sections.len() as f64,
+                            region.sections.values().filter(|s| s.body.is_some()).count() as f64,
+                            region.bodies.len() as f64, sim.impulse_joint_set.len() as f64,
+                            region.section_high_water as f64])
+                    },
                     _ => Err("unknown foundation operation".into()),
                 }
             }
