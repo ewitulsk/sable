@@ -78,3 +78,57 @@ diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
      const CHANGE_DETECTION_ENABLED: bool = true;
      const CHANGE_DETECTION_FACTOR: Real = 1.0e-2;
  
+diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_components.rs
+--- a/src/dynamics/rigid_body_components.rs
++++ b/src/dynamics/rigid_body_components.rs
+@@ -922,6 +922,8 @@
+     /// Gravity is multiplied by this scaling factor before it's
+     /// applied to this rigid-body.
+     pub gravity_scale: Real,
++    /// Optional planet-local gravity acceleration, independent of user forces.
++    pub planetary_gravity: Option<Vector>,
+     /// Forces applied by the user.
+     pub user_force: Vector,
+     /// Torque applied by the user.
+@@ -938,6 +940,7 @@
+             force: Vector::ZERO,
+             torque: 0.0,
+             gravity_scale: 1.0,
++            planetary_gravity: None,
+             user_force: Vector::ZERO,
+             user_torque: 0.0,
+         };
+@@ -947,6 +950,7 @@
+             force: Vector::ZERO,
+             torque: AngVector::ZERO,
+             gravity_scale: 1.0,
++            planetary_gravity: None,
+             user_force: Vector::ZERO,
+             user_torque: AngVector::ZERO,
+             gyroscopic_forces_enabled: false,
+@@ -975,7 +979,7 @@
+     /// Adds to `self` the gravitational force that would result in a gravitational acceleration
+     /// equal to `gravity`.
+     pub fn compute_effective_force_and_torque(&mut self, gravity: Vector, mass: Vector) {
+-        self.force = self.user_force + gravity * mass * self.gravity_scale;
++        self.force = self.user_force + self.planetary_gravity.unwrap_or(gravity * self.gravity_scale) * mass;
+         self.torque = self.user_torque;
+     }
+ 
+diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
+--- a/src/dynamics/rigid_body.rs
++++ b/src/dynamics/rigid_body.rs
+@@ -737,5 +737,13 @@
+     }
+ 
++    /// Replace the gravitational field without modifying external force accumulators.
++    pub fn planetary_set_gravity(&mut self, gravity: Option<Vector>) {
++        if self.forces.planetary_gravity != gravity {
++            self.forces.planetary_gravity = gravity;
++            self.wake_up(true);
++        }
++    }
++
+     /// The dominance group of this rigid-body.
+     pub fn dominance_group(&self) -> i8 {
+         self.dominance.0

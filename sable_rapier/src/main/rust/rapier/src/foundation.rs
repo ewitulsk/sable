@@ -8,15 +8,46 @@ use jni::{
 use rapier3d_f64::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const LIMIT: f64 = 512.0;
 const MAX_SECTIONS: usize = 4096;
 // Legacy query results carry IDs in doubles. Refuse precision loss until the typed query ABI lands.
 const MAX_EXACT_KEY: i64 = (1_i64 << 53) - 1;
+const MAX_PARTS_PER_SECTION: usize = 8192;
+const MAX_TOTAL_PARTS: usize = 131072;
+const MAX_PREPARATIONS: usize = 8;
+static LIVE_PARTS: AtomicUsize = AtomicUsize::new(0);
+static PREPARATIONS: AtomicUsize = AtomicUsize::new(0);
+struct PartBudget(usize);
+impl PartBudget {
+    fn reserve(parts: usize) -> Result<Self, String> {
+        LIVE_PARTS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |count| count.checked_add(parts).filter(|total| *total <= MAX_TOTAL_PARTS))
+            .map_err(|_| "global compound primitive budget exhausted")?;
+        Ok(Self(parts))
+    }
+}
+impl Drop for PartBudget { fn drop(&mut self) { LIVE_PARTS.fetch_sub(self.0, Ordering::AcqRel); } }
+struct PreparationSlot;
+impl PreparationSlot {
+    fn reserve() -> Result<Self, String> {
+        PREPARATIONS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |count| (count < MAX_PREPARATIONS).then_some(count + 1))
+            .map_err(|_| "native geometry preparation capacity exhausted")?;
+        Ok(Self)
+    }
+}
+impl Drop for PreparationSlot { fn drop(&mut self) { PREPARATIONS.fetch_sub(1, Ordering::AcqRel); } }
+struct PreparedShape { shape: Option<SharedShape>, budget: PartBudget, _slot: PreparationSlot }
+#[derive(Default)]
+struct PreparedRegistry { next: i64, shapes: HashMap<i64, PreparedShape> }
+static PREPARED: OnceLock<Mutex<PreparedRegistry>> = OnceLock::new();
 struct Section {
     revision: i64,
     body: Option<RigidBodyHandle>,
     collider: Option<ColliderHandle>,
+    _parts: PartBudget,
 }
 struct Region {
     sim: Simulation,
@@ -132,7 +163,7 @@ fn require(v: &[f64], n: usize) -> Result<(), String> {
 
 /// Exact greedy cuboid partition of occupied voxels. A section has no internal contact faces
 /// between merged cells; unlike a heightfield, arbitrary caves/overhangs remain representable.
-fn section_shape(cells: &[i32]) -> Option<SharedShape> {
+fn section_shape(cells: &[i32]) -> (Option<SharedShape>, usize) {
     let mut used = [false; 4096];
     let mut parts = vec![];
     let index = |x: usize, y: usize, z: usize| x + 16 * z + 256 * y;
@@ -179,10 +210,33 @@ fn section_shape(cells: &[i32]) -> Option<SharedShape> {
         }
     }
     if parts.is_empty() {
-        None
+        (None, 0)
     } else {
-        Some(SharedShape::compound(parts))
+        let count = parts.len();
+        (Some(SharedShape::compound(parts)), count)
     }
+}
+
+fn box_shape(values: &[f64], slot: PreparationSlot) -> Result<PreparedShape, String> {
+    if values.len() % 6 != 0 || values.len() / 6 > MAX_PARTS_PER_SECTION {
+        return Err("invalid compound primitive count".into());
+    }
+    for p in values.chunks_exact(6) {
+        if p.iter().any(|x| !x.is_finite() || *x < 0. || *x > 16.)
+            || p[0] >= p[3] || p[1] >= p[4] || p[2] >= p[5] {
+            return Err("compound AABBs require finite nonempty cube-local extents in [0,16]".into());
+        }
+    }
+    let budget = PartBudget::reserve(values.len() / 6)?;
+    let mut parts = Vec::with_capacity(budget.0);
+    for p in values.chunks_exact(6) {
+        let min = Vec3::new(p[0],p[1],p[2]);
+        let max = Vec3::new(p[3],p[4],p[5]);
+        let half = (max-min)*0.5;
+        parts.push((Pose::from_translation(min+half),SharedShape::cuboid(half.x,half.y,half.z)));
+    }
+    let shape = if parts.is_empty() { None } else { Some(SharedShape::compound(parts)) };
+    Ok(PreparedShape { shape, budget, _slot: slot })
 }
 
 #[unsafe(no_mangle)]
@@ -198,9 +252,13 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
 ) -> jdoubleArray {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<Vec<f64>, String> {
+            let preparation = if op == 1 || op == 14 || op == 20 {
+                Some(PreparationSlot::reserve()?)
+            } else { None };
             let n = env.get_array_length(&values).map_err(|e| e.to_string())?;
             let b = env.get_array_length(&blocks).map_err(|e| e.to_string())?;
-            if n > 32 || b > 4096 {
+            let max_values = if op == 20 { MAX_PARTS_PER_SECTION * 6 } else { 32 };
+            if n as usize > max_values || b > 4096 {
                 return Err("oversized foundation payload".into());
             }
             let mut v = vec![0.0; n as usize];
@@ -209,6 +267,35 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 .map_err(|e| e.to_string())?;
             env.get_int_array_region(&blocks, 0, &mut voxels)
                 .map_err(|e| e.to_string())?;
+            if op == 20 {
+                if b != 0 { return Err("prepared shape does not accept voxel cells".into()); }
+                let shape = box_shape(&v, preparation.unwrap())?;
+                let mut prepared = PREPARED.get_or_init(|| Mutex::new(PreparedRegistry::default()))
+                    .lock().map_err(|_| "prepared geometry registry poisoned")?;
+                if prepared.next == MAX_EXACT_KEY { return Err("prepared geometry identity exhausted".into()); }
+                prepared.next += 1;
+                let id = prepared.next;
+                prepared.shapes.insert(id,shape);
+                return Ok(vec![id as f64]);
+            }
+            if op == 21 {
+                require(&v,0)?;
+                PREPARED.get_or_init(|| Mutex::new(PreparedRegistry::default()))
+                    .lock().map_err(|_| "prepared geometry registry poisoned")?
+                    .shapes.remove(&key).ok_or("retired prepared geometry")?;
+                return Ok(vec![]);
+            }
+            // Partition legacy masks outside the simulation lock too. Reserve their worst-case
+            // primitive count before allocating shape parts, then release the unused reservation.
+            let mut binary_shape = if op == 1 || op == 14 {
+                if voxels.len() != 4096 || voxels.iter().any(|x| *x != 0 && *x != 1) {
+                    return Err("section requires 4096 binary collision cells".into());
+                }
+                let mut budget = PartBudget::reserve(4096)?;
+                let (shape,count) = section_shape(&voxels);
+                LIVE_PARTS.fetch_sub(budget.0-count,Ordering::AcqRel); budget.0=count;
+                Some(PreparedShape { shape, budget, _slot: preparation.unwrap() })
+            } else { None };
             let mut registry = REGISTRY
                 .get_or_init(|| Mutex::new(Registry::default()))
                 .lock()
@@ -264,9 +351,9 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
             {
                 let sim = &mut region.sim;
                 match op {
-                    1 | 2 | 14 | 15 => {
-                        let streamed = op == 14 || op == 15;
-                        let publishing = op == 1 || op == 14;
+                    1 | 2 | 14 | 15 | 19 => {
+                        let streamed = op == 14 || op == 15 || op == 19;
+                        let publishing = op == 1 || op == 14 || op == 19;
                         if streamed && !region.streamed_terrain && !region.sections.is_empty() {
                             return Err("cannot mix legacy and streamed terrain lifetimes".into());
                         }
@@ -296,19 +383,27 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             return Err("section key cap reached".into());
                         }
                         let translation = if publishing {
-                            require(&v, 3)?;
+                            require(&v, if op == 19 { 4 } else { 3 })?;
                             let p = vec(&v, 0)?;
                             bounded(p + Vec3::splat(16.))?;
-                            if voxels.len() != 4096 || voxels.iter().any(|x| *x != 0 && *x != 1) {
-                                return Err("section requires 4096 binary collision cells".into());
-                            }
                             p
                         } else {
                             require(&v, 0)?;
                             Vec3::ZERO
                         };
                         // Validate and prepare before removing the live collider. Failed requests leave it intact.
-                        let shape = if publishing { section_shape(&voxels) } else { None };
+                        let prepared = if op == 19 {
+                            if !v[3].is_finite() || v[3] < 1. || v[3] > MAX_EXACT_KEY as f64 || v[3].fract() != 0. {
+                                return Err("invalid prepared geometry identity".into());
+                            }
+                            Some(PREPARED.get_or_init(|| Mutex::new(PreparedRegistry::default()))
+                                .lock().map_err(|_| "prepared geometry registry poisoned")?
+                                .shapes.remove(&(v[3] as i64)).ok_or("retired prepared geometry")?)
+                        } else { binary_shape.take() };
+                        let (shape,parts) = match prepared {
+                            Some(p) => (p.shape,p.budget),
+                            None => (None,PartBudget(0)),
+                        };
                         if let Some(old) = region.sections.remove(&key) {
                             if let Some(h) = old.body {
                                 sim.rigid_body_set.remove(
@@ -325,6 +420,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             revision,
                             body: None,
                             collider: None,
+                            _parts: parts,
                         };
                         if publishing {
                             if let Some(shape) = shape {
@@ -528,7 +624,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                         sim.impulse_joint_set.len() as f64,
                         if region.failed_range { 1. } else { 0. },
                     ]),
-                    16 => { require(&v, 0)?; Ok(vec![1.0]) },
+                    16 => { require(&v, 0)?; Ok(vec![2.0]) },
                     17 => {
                         require(&v, 0)?;
                         let body = *region.bodies.get(&key).ok_or("unknown body")?;
@@ -545,6 +641,18 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             region.bodies.len() as f64, sim.impulse_joint_set.len() as f64,
                             region.section_high_water as f64])
                     },
+                    22 | 23 | 24 => {
+                        require(&v,if op == 23 { 0 } else { 3 })?;
+                        let field = if op == 23 { None } else { Some(vec(&v,0)?) };
+                        let body = *region.bodies.get(&key).ok_or("unknown body")?;
+                        let body = &mut sim.rigid_body_set[body];
+                        if !body.is_dynamic() { return Err("gravity/force requires dynamic body".into()); }
+                        if op == 24 { body.add_force(field.unwrap(),true); }
+                        else { body.planetary_set_gravity(field); }
+                        Ok(vec![])
+                    },
+                    25 => { require(&v,0)?; Ok(vec![LIVE_PARTS.load(Ordering::Acquire) as f64,
+                        PREPARATIONS.load(Ordering::Acquire) as f64]) },
                     _ => Err("unknown foundation operation".into()),
                 }
             }
