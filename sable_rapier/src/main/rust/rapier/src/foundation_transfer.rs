@@ -79,6 +79,19 @@ fn body_lease(region:&Region,ids:&[i64])->Result<RigidBodyHandle,String> {
     if ids[2]!=slot as i64 || ids[3]!=generation as i64 {return Err("recycled native body lease".into());}
     Ok(handle)
 }
+/// Conservative full-orientation sweep. End-pose AABBs miss a rotating thin body's middle arc.
+/// Pending kinematic motion and forces are included before their first simulation step.
+fn swept_bounds(body:&RigidBody,collider:&Collider,gravity:Vec3)->(Vec3,Vec3) {
+    let dt=0.05;
+    let local=collider.shape().compute_aabb(collider.position_wrt_parent().unwrap());
+    let com=body.local_center_of_mass();
+    let radius=(local.mins-com).abs().max((local.maxs-com).abs()).length()+collider.contact_skin();
+    let current=body.position().translation+body.position().rotation*com;
+    let queued=body.next_position().translation+body.next_position().rotation*com;
+    let travel=body.linvel().abs()*dt+body.planetary_linear_acceleration(gravity).abs()*dt*dt;
+    let halo=Vec3::splat(radius+body.soft_ccd_prediction()+0.05);
+    (current.min(queued)-travel-halo,current.max(queued)+travel+halo)
+}
 fn pose(values:&[f64])->Result<Pose,String> {
     let translation=vec(values,0)?;
     if values.len()<7 || values[3..7].iter().any(|v|!v.is_finite()) {return Err("invalid pose rotation".into());}
@@ -180,20 +193,13 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result
         let body=&source.sim.rigid_body_set[*handle];
         for collider in body.colliders() {
             let shape=&source.sim.collider_set[*collider];
-            let mut swept=shape.compute_aabb();
-            let queued=*body.next_position()*shape.position_wrt_parent().unwrap();
-            swept.merge(&shape.shape().compute_aabb(&queued));
-            let predicted=body.predict_position_using_velocity_and_forces(0.05)*shape.position_wrt_parent().unwrap();
-            swept.merge(&shape.shape().compute_aabb(&predicted));
-            let halo=body.soft_ccd_prediction()+0.05;
-            let min=swept.mins-Vec3::splat(halo);let max=swept.maxs+Vec3::splat(halo);
+            let (min,max)=swept_bounds(body,shape,source.sim.gravity);
             bounded(min-delta)?;bounded(max-delta)?;
             for (other_handle,other) in source.sim.rigid_body_set.iter() {
                 if selected.contains(&other_handle)||other.is_fixed(){continue;}
                 for other_collider in other.colliders() {
-                    let c=&source.sim.collider_set[*other_collider];let mut other_swept=c.compute_aabb();
-                    other_swept.merge(&c.shape().compute_aabb(&(other.predict_position_using_velocity_and_forces(0.05)*c.position_wrt_parent().unwrap())));
-                    if min.cmple(other_swept.maxs).all()&&max.cmpge(other_swept.mins).all(){
+                    let c=&source.sim.collider_set[*other_collider];let (other_min,other_max)=swept_bounds(other,c,source.sim.gravity);
+                    if min.cmple(other_max).all()&&max.cmpge(other_min).all(){
                         return Err("predicted dynamic interaction crosses transfer group boundary".into());
                     }
                 }

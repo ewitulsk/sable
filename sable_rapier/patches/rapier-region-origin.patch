@@ -34,11 +34,10 @@ diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
 diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
 --- a/src/dynamics/rigid_body.rs
 +++ b/src/dynamics/rigid_body.rs
-@@ -731,6 +731,14 @@
-             }
+@@ -732,6 +732,21 @@
  
              self.forces.gravity_scale = scale;
-+        }
+         }
 +    }
 +
 +    /// Replace the gravitational field without modifying external force accumulators.
@@ -46,9 +45,17 @@ diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
 +        if self.forces.planetary_gravity != gravity {
 +            self.forces.planetary_gravity = gravity;
 +            self.wake_up(true);
-         }
++        }
++    }
++
++    /// Acceleration from the current pending field/force, including locked translation axes.
++    pub fn planetary_linear_acceleration(&self, gravity: Vector) -> Vector {
++        let mut forces = self.forces;
++        forces.compute_effective_force_and_torque(gravity, self.mprops.effective_mass());
++        forces.force * self.mprops.effective_inv_mass
      }
  
+     /// The dominance group of this rigid-body.
 diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_components.rs
 --- a/src/dynamics/rigid_body_components.rs
 +++ b/src/dynamics/rigid_body_components.rs
