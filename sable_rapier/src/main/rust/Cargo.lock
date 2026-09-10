@@ -826,6 +826,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "parry3d-f64"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38558e45fda09a243836f590b9890f7f21dd2078dd7aafc876a9e8998d378d42"
+dependencies = [
+ "approx",
+ "arrayvec",
+ "bitflags",
+ "downcast-rs",
+ "either",
+ "ena",
+ "foldhash 0.2.0",
+ "glamx",
+ "hashbrown 0.16.1",
+ "log",
+ "num-derive",
+ "num-traits",
+ "ordered-float",
+ "rstar",
+ "simba",
+ "slab",
+ "smallvec",
+ "spade",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -915,6 +942,25 @@ dependencies = [
  "static_assertions",
  "thiserror 2.0.18",
  "wide",
+]
+
+[[package]]
+name = "rapier3d-f64"
+version = "0.32.0"
+dependencies = [
+ "approx",
+ "bitflags",
+ "glamx",
+ "log",
+ "nalgebra",
+ "num-traits",
+ "parry3d-f64",
+ "profiling",
+ "rayon",
+ "serde",
+ "simba",
+ "static_assertions",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1017,6 +1063,7 @@ dependencies = [
  "log",
  "marten",
  "rapier3d",
+ "rapier3d-f64",
  "rayon",
 ]
 

@@ -20,6 +20,7 @@ rapier3d = { git = "https://github.com/ryanhcode/rapier", rev = "38e92f117590862
 
 rayon = "1.10.0"
 dashmap = "7.0.0-rc2"
+rapier3d-f64 = { path = "../planetary-rapier/crates/rapier3d-f64", features = ["parallel"] }
 
 [lib]
 crate-type = ["cdylib", "lib"]

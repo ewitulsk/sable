@@ -138,3 +138,5 @@ runs/
 macos/*.dmg
 
 **/.intentionally-empty-file.o
+# Generated, pinned Rapier f64 source with the checked-in origin patch applied by the build helper.
+/sable_rapier/src/main/rust/planetary-rapier/

@@ -1,0 +1,80 @@
+diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
+--- a/src/dynamics/rigid_body_set.rs
++++ b/src/dynamics/rigid_body_set.rs
+@@ -79,6 +79,16 @@ pub struct RigidBodySet {
+ }
+ 
+ impl RigidBodySet {
++    /// Translate a complete scene's coordinate origin without waking bodies or changing motion.
++    /// The caller must also shift its colliders, narrow phase, and broad phase atomically.
++    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
++        for (_, body) in self.bodies.iter_mut() {
++            body.pos.position.translation -= delta;
++            body.pos.next_position.translation -= delta;
++            body.mprops.world_com -= delta;
++        }
++    }
++
+     /// Creates a new empty collection of rigid bodies.
+     ///
+     /// Call this once when setting up your physics world. The collection will
+diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
+--- a/src/geometry/collider_set.rs
++++ b/src/geometry/collider_set.rs
+@@ -53,6 +53,13 @@ pub struct ColliderSet {
+ }
+ 
+ impl ColliderSet {
++    /// Shift world poses only; collider-parent transforms and modification flags are unchanged.
++    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
++        for (_, collider) in self.colliders.iter_mut() {
++            collider.pos.0.translation -= delta;
++        }
++    }
++
+     /// Creates a new empty collection of colliders.
+     pub fn new() -> Self {
+         ColliderSet {
+diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
+--- a/src/geometry/narrow_phase.rs
++++ b/src/geometry/narrow_phase.rs
+@@ -83,6 +83,15 @@ impl Default for NarrowPhase {
+ }
+ 
+ impl NarrowPhase {
++    /// Contact anchors/warm starts are local. Only cached solver world points translate.
++    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
++        for edge in &mut self.contact_graph.graph.edges {
++            for manifold in &mut edge.weight.manifolds {
++                for contact in &mut manifold.data.solver_contacts { contact.point -= delta; }
++            }
++        }
++    }
++
+     /// Creates a new empty narrow-phase.
+     pub fn new() -> Self {
+         Self::with_query_dispatcher(DefaultQueryDispatcher)
+diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
+--- a/src/geometry/broad_phase_bvh.rs
++++ b/src/geometry/broad_phase_bvh.rs
+@@ -53,6 +53,20 @@ pub enum BvhOptimizationStrategy {
+ const ENABLE_TREE_VALIDITY_CHECK: bool = false;
+ 
+ impl BroadPhaseBvh {
++    /// Rebuild the bounded scene's tree using translated existing leaf bounds, preserving pairs.
++    /// Leaf padding/prediction and collider generations are retained; pending adds/removals stay pending.
++    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector, colliders: &ColliderSet) {
++        let leaves: Vec<_> = colliders.iter().filter_map(|(handle, _)| {
++            let key = handle.into_raw_parts().0;
++            self.tree.leaf_node(key).map(|leaf| {
++                let aabb = leaf.aabb();
++                (key as usize, Aabb::new(aabb.mins - delta, aabb.maxs - delta))
++            })
++        }).collect();
++        self.tree = Bvh::from_iter(parry::partitioning::BvhBuildStrategy::Binned, leaves);
++        self.workspace = BvhWorkspace::default();
++    }
++
+     const CHANGE_DETECTION_ENABLED: bool = true;
+     const CHANGE_DETECTION_FACTOR: Real = 1.0e-2;
+ 

@@ -6,6 +6,7 @@ mod config;
 mod contraptions;
 mod dispatcher;
 mod event_handler;
+mod foundation;
 mod groups;
 mod hooks;
 mod joints;
