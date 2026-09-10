@@ -40,6 +40,15 @@ impl Resources {
 }
 
 impl Simulation {
+    fn initialize_static_indexes(&mut self) {
+        // With no actors/constraints there is no solver state to preserve. Rebuilding the indexes
+        // also removes retired actors' deferred contacts and acknowledges exact current terrain.
+        self.pipeline=PhysicsPipeline::new();self.island_manager=IslandManager::new();
+        self.narrow_phase=NarrowPhase::new();self.ccd_solver=CCDSolver::new();
+        self.broad_phase=DefaultBroadPhase::new();
+        self.broad_phase.planetary_initialize_static(&self.parameters,&self.rigid_body_set,&self.collider_set);
+        self.rigid_body_set.planetary_clear_static_changes();self.collider_set.planetary_clear_static_changes();
+    }
     fn staged_clone(&self)->Self {
         Self { pipeline:PhysicsPipeline::new(),rigid_body_set:self.rigid_body_set.clone(),
             collider_set:self.collider_set.clone(),island_manager:self.island_manager.clone(),
@@ -400,6 +409,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
                 return Err("only an actor-free scene can adopt the shared simulation clock".into());
             }
             let next_mutation=region.mutation.checked_add(1).ok_or("scene mutation exhausted")?;
+            region.sim.initialize_static_indexes();
             region.time_nanos=ids[4];region.mutation=next_mutation;
             Ok(vec![scene,region.epoch,region.time_nanos,region.mutation])
         },

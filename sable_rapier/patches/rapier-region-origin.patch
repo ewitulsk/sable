@@ -1,10 +1,17 @@
 diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
 --- a/src/dynamics/rigid_body_set.rs
 +++ b/src/dynamics/rigid_body_set.rs
-@@ -79,6 +79,29 @@
+@@ -79,6 +79,36 @@
  }
  
  impl RigidBodySet {
++    /// Finalize an actor-free terrain scene without waking or integrating any body.
++    pub fn planetary_clear_static_changes(&mut self) {
++        assert!(self.bodies.iter().all(|(_, body)| body.is_fixed()));
++        for (_, body) in self.bodies.iter_mut() { body.changes = RigidBodyChanges::empty(); }
++        self.modified_bodies.clear();
++    }
++
 +    /// Preserve every physical field while keeping newly allocated destination links.
 +    pub fn planetary_restore_imported_body(&mut self, handle: RigidBodyHandle, original: &RigidBody, delta: crate::math::Vector) {
 +        let imported = self.bodies.get_mut(handle.0).unwrap();
@@ -96,10 +103,17 @@ diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_com
 diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
 --- a/src/geometry/collider_set.rs
 +++ b/src/geometry/collider_set.rs
-@@ -53,6 +53,27 @@
+@@ -53,6 +53,34 @@
  }
  
  impl ColliderSet {
++    /// Used only after rebuilding the complete actor-free scene's spatial indexes.
++    pub fn planetary_clear_static_changes(&mut self) {
++        for (_, collider) in self.colliders.iter_mut() { collider.changes = ColliderChanges::empty(); }
++        self.modified_colliders.clear();
++        self.removed_colliders.clear();
++    }
++
 +    /// Insert a cloned collider without falsely invalidating its cached shape workspace.
 +    pub fn planetary_import_collider(&mut self, original: &Collider, parent: RigidBodyHandle, bodies: &mut RigidBodySet, delta: crate::math::Vector) -> ColliderHandle {
 +        let mut collider = original.clone();
@@ -156,10 +170,17 @@ diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
 diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
 --- a/src/geometry/broad_phase_bvh.rs
 +++ b/src/geometry/broad_phase_bvh.rs
-@@ -53,6 +53,28 @@
+@@ -53,6 +53,35 @@
  const ENABLE_TREE_VALIDITY_CHECK: bool = false;
  
  impl BroadPhaseBvh {
++    /// Build broad-phase leaves for an actor-free scene without advancing its simulation clock.
++    pub fn planetary_initialize_static(&mut self, params: &IntegrationParameters, bodies: &RigidBodySet, colliders: &ColliderSet) {
++        for (handle, collider) in colliders.iter() {
++            if collider.is_enabled() { self.set_aabb(params, handle, collider.compute_broad_phase_aabb(params, bodies)); }
++        }
++    }
++
 +    /// Preserve a transferred collider's padded/predicted leaf without flagging a user edit.
 +    pub fn planetary_import_leaf(&mut self, source: &Self, old: ColliderHandle, new: ColliderHandle, delta: crate::math::Vector) {
 +        if let Some(leaf) = source.tree.leaf_node(old.into_raw_parts().0) {
