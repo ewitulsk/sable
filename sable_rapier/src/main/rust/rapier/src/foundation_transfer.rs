@@ -358,7 +358,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
             else {body.set_position(target,true);body.set_linvel(linear,true);body.set_angvel(angular,true);}
             region.mutation+=1;Ok(vec![])
         },
-        11 => {require(values,0)?;Ok(vec![2])},
+        11 => {require(values,0)?;Ok(vec![3])},
         12 => {
             if ids.len()!=5{return Err("body properties require complete body/frame lease".into());}require(values,12)?;
             if values.iter().any(|v|!v.is_finite())||values[0]<=0.||values[0]>1e9
@@ -380,6 +380,28 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
             body.recompute_mass_properties_from_colliders(&region.sim.collider_set);
             let activation=body.activation_mut();activation.normalized_linear_threshold=values[9];activation.angular_threshold=values[10];activation.time_until_sleep=values[11];
             region.mutation+=1;Ok(vec![])
+        },
+        13 => {
+            if !ids.is_empty(){return Err("scene clock query takes no identities".into());}require(values,0)?;
+            let region=lookup(registry,scene)?;
+            Ok(vec![scene,region.epoch,region.time_nanos,region.mutation])
+        },
+        14 => {
+            if ids.len()!=5{return Err("clock initialization requires complete expected scene clock and target time".into());}require(values,0)?;
+            if registry.transfer.is_some(){return Err("cannot initialize a scene clock while transfer staging exists".into());}
+            let region=registry.scenes.get_mut(&scene).ok_or("stale scene")?;
+            if region.failed_range || scene!=ids[0] || region.epoch!=ids[1] || region.time_nanos!=ids[2] || region.mutation!=ids[3] {
+                return Err("stale scene clock initialization lease".into());
+            }
+            if ids[4]<0 || ids[4]<region.time_nanos {return Err("simulation time cannot move backwards".into());}
+            if !region.bodies.is_empty() || !region.joints.is_empty() || region.sim.impulse_joint_set.len()!=0
+                || region.sim.multibody_joint_set.iter().next().is_some()
+                || region.sim.rigid_body_set.iter().any(|(_,body)|!body.is_fixed()) {
+                return Err("only an actor-free scene can adopt the shared simulation clock".into());
+            }
+            let next_mutation=region.mutation.checked_add(1).ok_or("scene mutation exhausted")?;
+            region.time_nanos=ids[4];region.mutation=next_mutation;
+            Ok(vec![scene,region.epoch,region.time_nanos,region.mutation])
         },
         _=>Err("unknown typed foundation operation".into()),
     }

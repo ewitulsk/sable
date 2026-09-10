@@ -362,9 +362,13 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 if !v[0].is_finite() || v[0] <= 0. || v[0] > 0.05 {
                     return Err("invalid step".into());
                 }
+                let elapsed_nanos=(v[0]*1_000_000_000.).round() as i64;
+                if elapsed_nanos<=0 {return Err("step is below native clock precision".into());}
+                let next_time=region.time_nanos.checked_add(elapsed_nanos).ok_or("simulation clock exhausted")?;
+                let next_mutation=region.mutation.checked_add(1).ok_or("scene mutation exhausted")?;
                 region.sim.step(v[0]);
-                region.time_nanos += (v[0]*1_000_000_000.).round() as i64;
-                region.mutation += 1;
+                region.time_nanos = next_time;
+                region.mutation = next_mutation;
                 if let Err(error) = region.sim.validate_bounds(Vec3::ZERO) {
                     region.failed_range = true;
                     return Err(error);
