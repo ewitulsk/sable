@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod transfer;
 #[path = "foundation_character.rs"]
 mod character;
+#[path = "foundation_terrain_batch.rs"]
+mod terrain_batch;
 
 const LIMIT: f64 = 512.0;
 const MAX_SECTIONS: usize = 4096;
@@ -57,6 +59,7 @@ struct Section {
     resident: bool,
 }
 struct Region {
+    terrain_batch: terrain_batch::State,
     sim: Simulation,
     sections: HashMap<i64, Section>,
     bodies: HashMap<i64, RigidBodyHandle>,
@@ -329,6 +332,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 registry.scenes.insert(
                     id,
                     Region {
+                        terrain_batch: Default::default(),
                         sim: Simulation::new(gravity),
                         sections: HashMap::new(),
                         bodies: HashMap::new(),

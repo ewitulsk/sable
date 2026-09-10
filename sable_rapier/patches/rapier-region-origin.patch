@@ -1,10 +1,16 @@
 diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
 --- a/src/dynamics/rigid_body_set.rs
 +++ b/src/dynamics/rigid_body_set.rs
-@@ -79,6 +79,36 @@
+@@ -79,6 +79,42 @@ pub struct RigidBodySet {
  }
  
  impl RigidBodySet {
++    /// Preallocate arena and modification storage before bounded static terrain replacement.
++    pub fn planetary_reserve_static_batch(&mut self, count: usize) {
++        let available = self.bodies.capacity() - self.bodies.len();
++        if available < count { self.bodies.reserve(count - available); }
++        self.modified_bodies.planetary_reserve(count);
++    }
 +    /// Finalize an actor-free terrain scene without waking or integrating any body.
 +    pub fn planetary_clear_static_changes(&mut self) {
 +        assert!(self.bodies.iter().all(|(_, body)| body.is_fixed()));
@@ -41,12 +47,10 @@ diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
 diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
 --- a/src/dynamics/rigid_body.rs
 +++ b/src/dynamics/rigid_body.rs
-@@ -732,6 +732,21 @@
- 
-             self.forces.gravity_scale = scale;
+@@ -734,6 +734,21 @@ impl RigidBody {
          }
-+    }
-+
+     }
+ 
 +    /// Replace the field; preserve awake sleep timers, strongly wake a changed sleeping body.
 +    pub fn planetary_set_gravity(&mut self, gravity: Option<Vector>) {
 +        if self.forces.planetary_gravity != gravity {
@@ -60,13 +64,15 @@ diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
 +        let mut forces = self.forces;
 +        forces.compute_effective_force_and_torque(gravity, self.mprops.effective_mass());
 +        forces.force * self.mprops.effective_inv_mass
-     }
- 
++    }
++
      /// The dominance group of this rigid-body.
+     pub fn dominance_group(&self) -> i8 {
+         self.dominance.0
 diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_components.rs
 --- a/src/dynamics/rigid_body_components.rs
 +++ b/src/dynamics/rigid_body_components.rs
-@@ -922,6 +922,8 @@
+@@ -922,6 +922,8 @@ pub struct RigidBodyForces {
      /// Gravity is multiplied by this scaling factor before it's
      /// applied to this rigid-body.
      pub gravity_scale: Real,
@@ -75,7 +81,7 @@ diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_com
      /// Forces applied by the user.
      pub user_force: Vector,
      /// Torque applied by the user.
-@@ -938,6 +940,7 @@
+@@ -938,6 +940,7 @@ impl Default for RigidBodyForces {
              force: Vector::ZERO,
              torque: 0.0,
              gravity_scale: 1.0,
@@ -83,7 +89,7 @@ diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_com
              user_force: Vector::ZERO,
              user_torque: 0.0,
          };
-@@ -947,6 +950,7 @@
+@@ -947,6 +950,7 @@ impl Default for RigidBodyForces {
              force: Vector::ZERO,
              torque: AngVector::ZERO,
              gravity_scale: 1.0,
@@ -91,7 +97,7 @@ diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_com
              user_force: Vector::ZERO,
              user_torque: AngVector::ZERO,
              gyroscopic_forces_enabled: false,
-@@ -975,7 +979,7 @@
+@@ -975,7 +979,7 @@ impl RigidBodyForces {
      /// Adds to `self` the gravitational force that would result in a gravitational acceleration
      /// equal to `gravity`.
      pub fn compute_effective_force_and_torque(&mut self, gravity: Vector, mass: Vector) {
@@ -103,10 +109,17 @@ diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_com
 diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
 --- a/src/geometry/collider_set.rs
 +++ b/src/geometry/collider_set.rs
-@@ -53,6 +53,34 @@
+@@ -53,6 +53,41 @@ pub struct ColliderSet {
  }
  
  impl ColliderSet {
++    /// Reserve insertion/removal bookkeeping before bounded static terrain replacement.
++    pub fn planetary_reserve_static_batch(&mut self, count: usize) {
++        let available = self.colliders.capacity() - self.colliders.len();
++        if available < count { self.colliders.reserve(count - available); }
++        self.modified_colliders.planetary_reserve(count);
++        self.removed_colliders.reserve(count);
++    }
 +    /// Used only after rebuilding the complete actor-free scene's spatial indexes.
 +    pub fn planetary_clear_static_changes(&mut self) {
 +        for (_, collider) in self.colliders.iter_mut() { collider.changes = ColliderChanges::empty(); }
@@ -141,7 +154,7 @@ diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
 diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
 --- a/src/geometry/narrow_phase.rs
 +++ b/src/geometry/narrow_phase.rs
-@@ -83,6 +83,25 @@
+@@ -83,6 +83,25 @@ impl Default for NarrowPhase {
  }
  
  impl NarrowPhase {
@@ -170,7 +183,7 @@ diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
 diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
 --- a/src/geometry/broad_phase_bvh.rs
 +++ b/src/geometry/broad_phase_bvh.rs
-@@ -53,6 +53,35 @@
+@@ -53,6 +53,35 @@ pub enum BvhOptimizationStrategy {
  const ENABLE_TREE_VALIDITY_CHECK: bool = false;
  
  impl BroadPhaseBvh {
@@ -209,7 +222,7 @@ diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
 diff --git a/src/dynamics/island_manager/manager.rs b/src/dynamics/island_manager/manager.rs
 --- a/src/dynamics/island_manager/manager.rs
 +++ b/src/dynamics/island_manager/manager.rs
-@@ -47,6 +47,33 @@
+@@ -47,6 +47,33 @@ pub struct IslandManager {
  }
  
  impl IslandManager {
@@ -243,3 +256,15 @@ diff --git a/src/dynamics/island_manager/manager.rs b/src/dynamics/island_manage
      /// Creates a new empty island manager.
      pub fn new() -> Self {
          Self::default()
+diff --git a/src/data/modified_objects.rs b/src/data/modified_objects.rs
+--- a/src/data/modified_objects.rs
++++ b/src/data/modified_objects.rs
+@@ -34,6 +34,8 @@ impl<Handle, Object> Deref for ModifiedObjects<Handle, Object> {
+ }
+ 
+ impl<Handle, Object: HasModifiedFlag> ModifiedObjects<Handle, Object> {
++    /// Reserve bounded mutation metadata before a planetary publication transaction.
++    pub fn planetary_reserve(&mut self, additional: usize) { self.0.reserve(additional); }
+     /// Preallocate memory for `capacity` handles
+     pub fn with_capacity(capacity: usize) -> Self {
+         Self(Vec::with_capacity(capacity), PhantomData)

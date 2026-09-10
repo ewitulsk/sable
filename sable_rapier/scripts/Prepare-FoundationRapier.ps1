@@ -39,5 +39,5 @@ $manifest = [regex]::Replace($manifest,'(?s)members = \[.*?\]','members = ["crat
 if ($LASTEXITCODE -ne 0) { throw 'Pinned origin patch cannot apply cleanly' }
 & git -C $generated apply --unidiff-zero $patch
 if ($LASTEXITCODE -ne 0) { throw 'Pinned origin patch failed' }
-$files = @('Cargo.toml','src/dynamics/rigid_body_set.rs','src/dynamics/rigid_body.rs','src/dynamics/rigid_body_components.rs','src/dynamics/island_manager/manager.rs','src/geometry/collider_set.rs','src/geometry/narrow_phase.rs','src/geometry/broad_phase_bvh.rs') | ForEach-Object { @{path=$_;sha256=(Get-FileHash -LiteralPath (Join-Path $generated $_)).Hash} }
+$files = @('Cargo.toml','src/dynamics/rigid_body_set.rs','src/dynamics/rigid_body.rs','src/dynamics/rigid_body_components.rs','src/dynamics/island_manager/manager.rs','src/geometry/collider_set.rs','src/geometry/narrow_phase.rs','src/geometry/broad_phase_bvh.rs','src/data/modified_objects.rs') | ForEach-Object { @{path=$_;sha256=(Get-FileHash -LiteralPath (Join-Path $generated $_)).Hash} }
 @{source='https://github.com/ryanhcode/rapier';revision=$revision;patchSha256=$patchHash;license='Apache-2.0';files=$files} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $receiptPath -Encoding utf8

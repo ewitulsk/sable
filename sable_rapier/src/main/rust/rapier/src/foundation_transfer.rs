@@ -415,6 +415,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
             Ok(vec![scene,region.epoch,region.time_nanos,region.mutation])
         },
         20..=27 => character::dispatch(registry,scene,op,ids,values),
+        30..=33 => terrain_batch::dispatch(registry,scene,op,ids,values),
         _=>Err("unknown typed foundation operation".into()),
     }
 }
