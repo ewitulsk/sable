@@ -86,36 +86,7 @@ fn prepare(registry:&Registry,scene:i64,ids:&[i64],values:&[f64],witness_id:i64)
             +angular.dot(props.effective_world_inv_inertia*angular);
         let approach=(hit.translation_remaining/dt-body.velocity_at_point(point)).dot(direction).max(0.);
         if !inverse_mass.is_finite()||inverse_mass<=0.||!approach.is_finite(){return Err("invalid character effective contact mass".into());}
-        let mut impulse=approach/inverse_mass;
-        // A finite-mass character cannot keep injecting closing momentum into an immovable
-        // support. Bound its additional point velocity by the actual available clearance,
-        // including the angular response at that support. Existing body velocity/contact
-        // impulses remain the native solver's responsibility.
-        let linear_per_impulse=direction*props.effective_inv_mass;
-        let angular_per_impulse=props.effective_world_inv_inertia*angular;
-        let prediction=(body.linvel().length()+impulse*linear_per_impulse.length()
-            +(body.angvel().length()+impulse*angular_per_impulse.length())*current.compute_aabb().half_extents().length())*dt+SKIN;
-        let mut support_count=0;let mut support_primitives=0;
-        for (_,support) in queries.intersect_aabb_conservative(current.compute_aabb().loosened(prediction)){
-            if support.parent()==Some(handle)||support.parent().is_some_and(|p|region.sim.rigid_body_set[p].is_dynamic()){continue;}
-            support_count+=1;support_primitives+=support.shape().as_compound().map_or(1,|s|s.shapes().len());
-            if support_count>MAX_CANDIDATES||support_primitives>MAX_PRIMITIVES{return Err("character support query cap".into());}
-            let mut manifolds:Vec<ContactManifold<(),()>>=Vec::new();
-            dispatcher.contact_manifolds(&current.position().inv_mul(support.position()),current.shape(),support.shape(),prediction,&mut manifolds,&mut None).map_err(|_|"unsupported character support shape")?;
-            let mut support_points=0;
-            for manifold in &manifolds{let pose1=*current.position()*manifold.subshape_pos1.unwrap_or(Pose::IDENTITY);let pose2=*support.position()*manifold.subshape_pos2.unwrap_or(Pose::IDENTITY);let normal=pose1.rotation*manifold.local_n1;
-              for contact in &manifold.points{support_points+=1;if support_points>MAX_CONTACTS{return Err("character support manifold cap".into());}
-                let point1=pose1*contact.local_p1;let point2=pose2*contact.local_p2;
-                let response=(linear_per_impulse+angular_per_impulse.cross(point1-body.center_of_mass())).dot(normal);
-                if response>1e-9{
-                    let support_velocity=support.parent().map_or(Vec3::ZERO,|p|region.sim.rigid_body_set[p].velocity_at_point(point2));
-                    let closing=(body.velocity_at_point(point1)-support_velocity).dot(normal);
-                    impulse=impulse.min((((contact.dist-SKIN).max(0.)/dt-closing)/response).max(0.));
-                }
-              }
-            }
-        }
-        body.apply_impulse_at_point(direction*impulse,point,true);
+        body.apply_impulse_at_point(direction*(approach/inverse_mass),point,true);
     }
     let mut reactions=Vec::new();let mut unique=HashSet::new();
     for collider in dynamic{let handle=colliders[collider].parent().unwrap();if !unique.insert(handle){continue;}
