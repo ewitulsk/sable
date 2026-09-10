@@ -1,7 +1,7 @@
 //! Bounded f64 character contact witnesses. No actor rigid-body proxy, force input, or physics step.
 use super::*;
 use rapier3d_f64::control::{CharacterCollision,CharacterLength,KinematicCharacterController};
-use rapier3d_f64::parry::{bounding_volume::BoundingVolume,partitioning::{Bvh,BvhBuildStrategy},query::DefaultQueryDispatcher};
+use rapier3d_f64::parry::{bounding_volume::BoundingVolume,partitioning::{Bvh,BvhBuildStrategy},query::{DefaultQueryDispatcher,PersistentQueryDispatcher,ContactManifold}};
 use std::collections::HashSet;
 
 const MAX_ACTORS:usize=128;
@@ -71,7 +71,16 @@ fn prepare(registry:&Registry,scene:i64,ids:&[i64],values:&[f64],witness_id:i64)
     let mut reacted=HashSet::new();
     for hit in contacts.iter().filter(|c|dynamic.contains(&c.handle)){
         let handle=colliders[hit.handle].parent().unwrap();if !reacted.insert(handle){continue;}
-        let body=&mut staged[handle];let direction=-hit.hit.normal1;let point=hit.hit.witness1;
+        let body=&mut staged[handle];let direction=-hit.hit.normal1;
+        // The cast witness may select an arbitrary corner of two parallel faces. Use the
+        // actual contact patch centroid for its resultant impulse instead of creating an
+        // orientation-dependent torque from that arbitrary single GJK witness.
+        let current=&colliders[hit.handle];let mut patch:Vec<ContactManifold<(),()>>=Vec::new();
+        dispatcher.contact_manifolds(&hit.character_pos.inv_mul(current.position()),shape.as_ref(),current.shape(),SKIN*2.,&mut patch,&mut None).map_err(|_|"unsupported character reaction manifold")?;
+        let mut point=Vec3::ZERO;let mut point_count=0;
+        for manifold in &patch{let pose=*current.position()*manifold.subshape_pos2.unwrap_or(Pose::IDENTITY);
+            for p in &manifold.points{if p.dist<=SKIN*2.{point+=pose*p.local_p2;point_count+=1;if point_count>MAX_CONTACTS{return Err("character reaction manifold cap".into());}}}}
+        if point_count==0{return Err("character cast has no current contact patch".into());}point/=point_count as f64;
         let arm=point-body.center_of_mass();let angular=arm.cross(direction);let props=body.mass_properties();
         let inverse_mass=1./a.mass+(direction*props.effective_inv_mass).dot(direction)
             +angular.dot(props.effective_world_inv_inertia*angular);
@@ -84,7 +93,6 @@ fn prepare(registry:&Registry,scene:i64,ids:&[i64],values:&[f64],witness_id:i64)
         // impulses remain the native solver's responsibility.
         let linear_per_impulse=direction*props.effective_inv_mass;
         let angular_per_impulse=props.effective_world_inv_inertia*angular;
-        let current=&colliders[hit.handle];
         let prediction=(body.linvel().length()+impulse*linear_per_impulse.length()
             +(body.angvel().length()+impulse*angular_per_impulse.length())*current.compute_aabb().half_extents().length())*dt+SKIN;
         let mut support_count=0;let mut support_primitives=0;
@@ -92,14 +100,19 @@ fn prepare(registry:&Registry,scene:i64,ids:&[i64],values:&[f64],witness_id:i64)
             if support.parent()==Some(handle)||support.parent().is_some_and(|p|region.sim.rigid_body_set[p].is_dynamic()){continue;}
             support_count+=1;support_primitives+=support.shape().as_compound().map_or(1,|s|s.shapes().len());
             if support_count>MAX_CANDIDATES||support_primitives>MAX_PRIMITIVES{return Err("character support query cap".into());}
-            if let Some(contact)=rapier3d_f64::parry::query::contact(current.position(),current.shape(),support.position(),support.shape(),prediction).map_err(|_|"unsupported character support shape")?{
-                let response=(linear_per_impulse+angular_per_impulse.cross(contact.point1-body.center_of_mass())).dot(contact.normal1);
-                if ids[6]>=80&&ids[6]<=84 {eprintln!("CHAR_SUPPORT seq={} J={} response={} dist={} normal={:?} point={:?}",ids[6],impulse,response,contact.dist,contact.normal1,contact.point1);}
+            let mut manifolds:Vec<ContactManifold<(),()>>=Vec::new();
+            dispatcher.contact_manifolds(&current.position().inv_mul(support.position()),current.shape(),support.shape(),prediction,&mut manifolds,&mut None).map_err(|_|"unsupported character support shape")?;
+            let mut support_points=0;
+            for manifold in &manifolds{let pose1=*current.position()*manifold.subshape_pos1.unwrap_or(Pose::IDENTITY);let pose2=*support.position()*manifold.subshape_pos2.unwrap_or(Pose::IDENTITY);let normal=pose1.rotation*manifold.local_n1;
+              for contact in &manifold.points{support_points+=1;if support_points>MAX_CONTACTS{return Err("character support manifold cap".into());}
+                let point1=pose1*contact.local_p1;let point2=pose2*contact.local_p2;
+                let response=(linear_per_impulse+angular_per_impulse.cross(point1-body.center_of_mass())).dot(normal);
                 if response>1e-9{
-                    let support_velocity=support.parent().map_or(Vec3::ZERO,|p|region.sim.rigid_body_set[p].velocity_at_point(contact.point2));
-                    let closing=(body.velocity_at_point(contact.point1)-support_velocity).dot(contact.normal1);
+                    let support_velocity=support.parent().map_or(Vec3::ZERO,|p|region.sim.rigid_body_set[p].velocity_at_point(point2));
+                    let closing=(body.velocity_at_point(point1)-support_velocity).dot(normal);
                     impulse=impulse.min((((contact.dist-SKIN).max(0.)/dt-closing)/response).max(0.));
                 }
+              }
             }
         }
         body.apply_impulse_at_point(direction*impulse,point,true);
