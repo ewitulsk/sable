@@ -132,3 +132,51 @@ diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
      /// The dominance group of this rigid-body.
      pub fn dominance_group(&self) -> i8 {
          self.dominance.0
+diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
+--- a/src/geometry/narrow_phase.rs
++++ b/src/geometry/narrow_phase.rs
+@@ -85,1 +85,11 @@
+ impl NarrowPhase {
++    /// Import remapped persistent contact data, including manifold workspaces and solver impulses.
++    pub fn planetary_import_contact(&mut self, colliders: &ColliderSet, pair: ContactPair) {
++        let a = pair.collider1;
++        let b = pair.collider2;
++        self.add_pair(colliders, &ColliderPair { collider1: a, collider2: b });
++        let ga = self.graph_indices.get(a.0).unwrap().contact_graph_index;
++        let gb = self.graph_indices.get(b.0).unwrap().contact_graph_index;
++        let edge = self.contact_graph.graph.find_edge(ga, gb).unwrap();
++        *self.contact_graph.graph.edge_weight_mut(edge).unwrap() = pair;
++    }
+diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
+--- a/src/dynamics/rigid_body_set.rs
++++ b/src/dynamics/rigid_body_set.rs
+@@ -81,1 +81,16 @@
+ impl RigidBodySet {
++    /// Preserve every physical field while keeping newly allocated destination links.
++    pub fn planetary_restore_imported_body(&mut self, handle: RigidBodyHandle, original: &RigidBody, delta: crate::math::Vector) {
++        let imported = self.bodies.get_mut(handle.0).unwrap();
++        let ids = imported.ids;
++        let colliders = imported.colliders.clone();
++        *imported = original.clone();
++        imported.ids = ids;
++        imported.colliders = colliders;
++        imported.pos.position.translation -= delta;
++        imported.pos.next_position.translation -= delta;
++        imported.mprops.world_com -= delta;
++        imported.changes = RigidBodyChanges::all();
++        imported.changes.remove(RigidBodyChanges::LOCAL_MASS_PROPERTIES | RigidBodyChanges::COLLIDERS);
++        imported.activation.sleep_root_state = crate::dynamics::SleepRootState::Unknown;
++    }
+diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
+--- a/src/geometry/collider_set.rs
++++ b/src/geometry/collider_set.rs
+@@ -55,1 +55,9 @@
+ impl ColliderSet {
++    /// Insert a cloned collider without falsely invalidating its cached shape workspace.
++    pub fn planetary_import_collider(&mut self, original: &Collider, parent: RigidBodyHandle, bodies: &mut RigidBodySet, delta: crate::math::Vector) -> ColliderHandle {
++        let handle = self.insert_with_parent(original.clone(), parent, bodies);
++        let collider = self.colliders.get_mut(handle.0).unwrap();
++        collider.pos.0.translation = original.pos.0.translation - delta;
++        collider.changes = ColliderChanges::POSITION | ColliderChanges::IN_MODIFIED_SET;
++        handle
++    }

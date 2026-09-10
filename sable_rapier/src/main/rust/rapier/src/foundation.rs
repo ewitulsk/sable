@@ -9,6 +9,8 @@ use rapier3d_f64::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[path = "foundation_transfer.rs"]
+mod transfer;
 
 const LIMIT: f64 = 512.0;
 const MAX_SECTIONS: usize = 4096;
@@ -39,7 +41,7 @@ impl PreparationSlot {
     }
 }
 impl Drop for PreparationSlot { fn drop(&mut self) { PREPARATIONS.fetch_sub(1, Ordering::AcqRel); } }
-struct PreparedShape { shape: Option<SharedShape>, budget: PartBudget, _slot: PreparationSlot }
+struct PreparedShape { shape: Option<SharedShape>, budget: PartBudget, fingerprint: u64, _slot: PreparationSlot }
 #[derive(Default)]
 struct PreparedRegistry { next: i64, shapes: HashMap<i64, PreparedShape> }
 static PREPARED: OnceLock<Mutex<PreparedRegistry>> = OnceLock::new();
@@ -48,6 +50,9 @@ struct Section {
     body: Option<RigidBodyHandle>,
     collider: Option<ColliderHandle>,
     _parts: PartBudget,
+    fingerprint: u64,
+    translation: Vec3,
+    resident: bool,
 }
 struct Region {
     sim: Simulation,
@@ -57,6 +62,11 @@ struct Region {
     failed_range: bool,
     streamed_terrain: bool,
     section_high_water: i64,
+    mutation: i64,
+    time_nanos: i64,
+    body_epochs: HashMap<i64,i64>,
+    joints: HashMap<i64,ImpulseJointHandle>,
+    next_legacy_joint: i64,
 }
 struct Simulation {
     pipeline: PhysicsPipeline,
@@ -134,6 +144,8 @@ impl Simulation {
 struct Registry {
     next: i64,
     scenes: HashMap<i64, Region>,
+    next_transfer: i64,
+    transfer: Option<transfer::PreparedTransfer>,
 }
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 fn bounded(v: Vec3) -> Result<Vec3, String> {
@@ -159,6 +171,9 @@ fn require(v: &[f64], n: usize) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+fn fingerprint(values: impl Iterator<Item=u64>) -> u64 {
+    values.fold(0xcbf29ce484222325, |hash,value| (hash ^ value).wrapping_mul(0x100000001b3))
 }
 
 /// Exact greedy cuboid partition of occupied voxels. A section has no internal contact faces
@@ -236,7 +251,7 @@ fn box_shape(values: &[f64], slot: PreparationSlot) -> Result<PreparedShape, Str
         parts.push((Pose::from_translation(min+half),SharedShape::cuboid(half.x,half.y,half.z)));
     }
     let shape = if parts.is_empty() { None } else { Some(SharedShape::compound(parts)) };
-    Ok(PreparedShape { shape, budget, _slot: slot })
+    Ok(PreparedShape { shape, budget, fingerprint: fingerprint(values.iter().map(|x| x.to_bits())), _slot: slot })
 }
 
 #[unsafe(no_mangle)]
@@ -294,7 +309,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 let mut budget = PartBudget::reserve(4096)?;
                 let (shape,count) = section_shape(&voxels);
                 LIVE_PARTS.fetch_sub(budget.0-count,Ordering::AcqRel); budget.0=count;
-                Some(PreparedShape { shape, budget, _slot: preparation.unwrap() })
+                Some(PreparedShape { shape, budget, fingerprint: fingerprint(voxels.iter().map(|x| *x as u64)), _slot: preparation.unwrap() })
             } else { None };
             let mut registry = REGISTRY
                 .get_or_init(|| Mutex::new(Registry::default()))
@@ -318,6 +333,11 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                         failed_range: false,
                         streamed_terrain: false,
                         section_high_water: 0,
+                        mutation: 0,
+                        time_nanos: 0,
+                        body_epochs: HashMap::new(),
+                        joints: HashMap::new(),
+                        next_legacy_joint: 0,
                     },
                 );
                 return Ok(vec![id as f64, 1.0]);
@@ -342,13 +362,15 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                     return Err("invalid step".into());
                 }
                 region.sim.step(v[0]);
+                region.time_nanos += (v[0]*1_000_000_000.).round() as i64;
+                region.mutation += 1;
                 if let Err(error) = region.sim.validate_bounds(Vec3::ZERO) {
                     region.failed_range = true;
                     return Err(error);
                 }
                 return Ok(vec![]);
             }
-            {
+            let result = {
                 let sim = &mut region.sim;
                 match op {
                     1 | 2 | 14 | 15 | 19 => {
@@ -400,9 +422,9 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                                 .lock().map_err(|_| "prepared geometry registry poisoned")?
                                 .shapes.remove(&(v[3] as i64)).ok_or("retired prepared geometry")?)
                         } else { binary_shape.take() };
-                        let (shape,parts) = match prepared {
-                            Some(p) => (p.shape,p.budget),
-                            None => (None,PartBudget(0)),
+                        let (shape,parts,fingerprint) = match prepared {
+                            Some(p) => (p.shape,p.budget,p.fingerprint),
+                            None => (None,PartBudget(0),0),
                         };
                         if let Some(old) = region.sections.remove(&key) {
                             if let Some(h) = old.body {
@@ -421,6 +443,9 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             body: None,
                             collider: None,
                             _parts: parts,
+                            fingerprint,
+                            translation,
+                            resident: publishing,
                         };
                         if publishing {
                             if let Some(shape) = shape {
@@ -479,6 +504,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             &mut sim.rigid_body_set,
                         );
                         region.bodies.insert(key, h);
+                        region.body_epochs.insert(key,0);
                         Ok(vec![key as f64])
                     }
                     5 => {
@@ -543,6 +569,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                         sim.ccd_solver = CCDSolver::new();
                         sim.pipeline = PhysicsPipeline::new();
                         region.epoch = revision;
+                        for section in region.sections.values_mut() { section.translation -= delta; }
                         Ok(vec![region.epoch as f64])
                     }
                     7 => {
@@ -587,7 +614,9 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             .local_anchor1(vec(&v, 0)?)
                             .local_anchor2(vec(&v, 3)?)
                             .contacts_enabled(false);
-                        sim.impulse_joint_set.insert(a, b, j, true);
+                        let joint=sim.impulse_joint_set.insert(a, b, j, true);
+                        region.next_legacy_joint -= 1;
+                        region.joints.insert(region.next_legacy_joint,joint);
                         Ok(vec![])
                     }
                     9 => {
@@ -632,6 +661,8 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             &mut sim.collider_set, &mut sim.impulse_joint_set,
                             &mut sim.multibody_joint_set, true).ok_or("stale body registry")?;
                         region.bodies.remove(&key);
+                        region.body_epochs.remove(&key);
+                        region.joints.retain(|_,joint| sim.impulse_joint_set.get(*joint).is_some());
                         Ok(vec![])
                     },
                     18 => {
@@ -653,9 +684,12 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                     },
                     25 => { require(&v,0)?; Ok(vec![LIVE_PARTS.load(Ordering::Acquire) as f64,
                         PREPARATIONS.load(Ordering::Acquire) as f64]) },
+                    26 => { require(&v,0)?; transfer::body_state(region,key,revision) },
                     _ => Err("unknown foundation operation".into()),
                 }
-            }
+            };
+            if result.is_ok() && !matches!(op,5|7|13|16|18|25|26) { region.mutation += 1; }
+            result
         },
     ));
     let output = match result {

@@ -35,9 +35,9 @@ $manifest = [IO.File]::ReadAllText($manifestPath)
 $manifest = [regex]::Replace($manifest,'(?s)members = \[.*?\]','members = ["crates/rapier3d-f64"]',1)
 [IO.File]::WriteAllText($manifestPath,$manifest,[Text.UTF8Encoding]::new($false))
 & git -C $generated init --quiet
-& git -C $generated apply --check $patch
+& git -C $generated apply --check --unidiff-zero $patch
 if ($LASTEXITCODE -ne 0) { throw 'Pinned origin patch cannot apply cleanly' }
-& git -C $generated apply $patch
+& git -C $generated apply --unidiff-zero $patch
 if ($LASTEXITCODE -ne 0) { throw 'Pinned origin patch failed' }
 $files = @('Cargo.toml','src/dynamics/rigid_body_set.rs','src/dynamics/rigid_body.rs','src/dynamics/rigid_body_components.rs','src/geometry/collider_set.rs','src/geometry/narrow_phase.rs','src/geometry/broad_phase_bvh.rs') | ForEach-Object { @{path=$_;sha256=(Get-FileHash -LiteralPath (Join-Path $generated $_)).Hash} }
 @{source='https://github.com/ryanhcode/rapier';revision=$revision;patchSha256=$patchHash;license='Apache-2.0';files=$files} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $receiptPath -Encoding utf8
