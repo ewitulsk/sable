@@ -15,13 +15,13 @@ struct Section {
     revision: i64,
     body: Option<RigidBodyHandle>,
     collider: Option<ColliderHandle>,
-    voxels: Vec<i32>,
 }
 struct Region {
     sim: Simulation,
     sections: HashMap<i64, Section>,
     bodies: HashMap<i64, RigidBodyHandle>,
     epoch: i64,
+    failed_range: bool,
 }
 struct Simulation {
     pipeline: PhysicsPipeline,
@@ -37,6 +37,25 @@ struct Simulation {
     parameters: IntegrationParameters,
 }
 impl Simulation {
+    fn validate_bounds(&self, delta: Vec3) -> Result<(), String> {
+        for (_, body) in self.rigid_body_set.iter() {
+            bounded(body.position().translation - delta)?;
+            bounded(body.next_position().translation - delta)?;
+        }
+        for (_, collider) in self.collider_set.iter() {
+            let aabb = collider.compute_aabb();
+            bounded(aabb.mins - delta)?;
+            bounded(aabb.maxs - delta)?;
+            if let Some(parent) = collider.parent() {
+                let queued = *self.rigid_body_set[parent].next_position()
+                    * collider.position_wrt_parent().unwrap();
+                let aabb = collider.shape().compute_aabb(&queued);
+                bounded(aabb.mins - delta)?;
+                bounded(aabb.maxs - delta)?;
+            }
+        }
+        Ok(())
+    }
     fn new(gravity: Vec3) -> Self {
         Self {
             pipeline: PhysicsPipeline::new(),
@@ -205,6 +224,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                         sections: HashMap::new(),
                         bodies: HashMap::new(),
                         epoch: 0,
+                        failed_range: false,
                     },
                 );
                 return Ok(vec![id as f64, 1.0]);
@@ -220,12 +240,19 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 .scenes
                 .get_mut(&handle)
                 .ok_or("stale scene handle")?;
+            if region.failed_range && op != 5 && op != 13 {
+                return Err("scene escaped local bounds; inspect and retire it".into());
+            }
             if op == 4 {
                 require(&v, 1)?;
                 if !v[0].is_finite() || v[0] <= 0. || v[0] > 0.05 {
                     return Err("invalid step".into());
                 }
                 region.sim.step(v[0]);
+                if let Err(error) = region.sim.validate_bounds(Vec3::ZERO) {
+                    region.failed_range = true;
+                    return Err(error);
+                }
                 return Ok(vec![]);
             }
             {
@@ -274,7 +301,6 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             revision,
                             body: None,
                             collider: None,
-                            voxels: vec![],
                         };
                         if op == 1 {
                             if let Some(shape) = section_shape(&voxels) {
@@ -292,7 +318,6 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                                 section.body = Some(body);
                                 section.collider = Some(collider);
                             }
-                            section.voxels = voxels;
                         }
                         region.sections.insert(key, section);
                         Ok(vec![revision as f64])
@@ -375,6 +400,8 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             next.translation.x as f64,
                             next.translation.y as f64,
                             next.translation.z as f64,
+                            h.into_raw_parts().0 as f64,
+                            h.into_raw_parts().1 as f64,
                         ])
                     }
                     6 => {
@@ -383,16 +410,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                         if revision != region.epoch + 1 {
                             return Err("stale frame epoch".into());
                         }
-                        // Validate every resulting pose and collider AABB before any mutation.
-                        for (_, rb) in sim.rigid_body_set.iter() {
-                            bounded(rb.position().translation - delta)?;
-                            bounded(rb.next_position().translation - delta)?;
-                        }
-                        for (_, c) in sim.collider_set.iter() {
-                            let a = c.compute_aabb();
-                            bounded(a.mins - delta)?;
-                            bounded(a.maxs - delta)?;
-                        }
+                        sim.validate_bounds(delta)?;
                         sim.rigid_body_set.planetary_shift_origin(delta);
                         sim.collider_set.planetary_shift_origin(delta);
                         sim.narrow_phase.planetary_shift_origin(delta);
@@ -415,7 +433,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                         {
                             return Err("invalid ray".into());
                         }
-                        let ray = Ray::new(origin, direction);
+                        let ray = Ray::new(origin, direction.normalize());
                         let mut nearest = v[6];
                         let mut hit = -1.;
                         for (key, s) in &region.sections {
@@ -480,6 +498,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             .count() as f64,
                         region.bodies.len() as f64,
                         sim.impulse_joint_set.len() as f64,
+                        if region.failed_range { 1. } else { 0. },
                     ]),
                     _ => Err("unknown foundation operation".into()),
                 }
