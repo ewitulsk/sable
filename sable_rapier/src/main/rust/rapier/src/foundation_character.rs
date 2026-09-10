@@ -49,7 +49,7 @@ fn prepare(registry:&Registry,scene:i64,ids:&[i64],values:&[f64],witness_id:i64)
     let shape=SharedShape::cuboid(a.half.x,a.half.y,a.half.z);
     let initial=shape.compute_aabb(&start);let finish=shape.compute_aabb(&Pose{translation:start.translation+motion,rotation:start.rotation});
     let broad=initial.merged(&finish).loosened(0.1);bounded(broad.mins)?;bounded(broad.maxs)?;
-    let (mut colliders,bvh)=query_snapshot(region)?;let dispatcher=DefaultQueryDispatcher;
+    let (colliders,bvh)=query_snapshot(region)?;let dispatcher=DefaultQueryDispatcher;
     let queries=QueryPipeline{dispatcher:&dispatcher,bvh:&bvh,bodies:&region.sim.rigid_body_set,colliders:&colliders,filter:QueryFilter::default()};
     let mut candidates=0;let mut primitives=0;
     for (_,c) in queries.intersect_aabb_conservative(broad){
@@ -65,10 +65,20 @@ fn prepare(registry:&Registry,scene:i64,ids:&[i64],values:&[f64],witness_id:i64)
     let mut dynamic=HashSet::new();
     for hit in &contacts{if let Some(parent)=colliders[hit.handle].parent(){if region.sim.rigid_body_set[parent].is_dynamic(){dynamic.insert(hit.handle);}}}
     let mut staged=region.sim.rigid_body_set.clone();
-    // A wall contact must not transfer momentum to a nearby body hidden behind that wall.
-    let filter=|handle:ColliderHandle,_:&Collider|dynamic.contains(&handle);
-    let mut queries=QueryPipelineMut{dispatcher:&dispatcher,bvh:&bvh,bodies:&mut staged,colliders:&mut colliders,filter:QueryFilter::default().predicate(&filter)};
-    controller.solve_character_collision_impulses(dt,&mut queries,shape.as_ref(),a.mass,contacts.iter().filter(|c|dynamic.contains(&c.handle)));
+    // A wall cannot push an occluded neighbour. One reaction per witnessed dynamic body uses
+    // full point effective mass (including rotational inertia), not a repeated mass-only kick
+    // per manifold point. The character's finite server-owned mass bounds the momentum exchange.
+    let mut reacted=HashSet::new();
+    for hit in contacts.iter().filter(|c|dynamic.contains(&c.handle)){
+        let handle=colliders[hit.handle].parent().unwrap();if !reacted.insert(handle){continue;}
+        let body=&mut staged[handle];let direction=-hit.hit.normal1;let point=hit.hit.witness1;
+        let arm=point-body.center_of_mass();let angular=arm.cross(direction);let props=body.mass_properties();
+        let inverse_mass=1./a.mass+(direction*props.effective_inv_mass).dot(direction)
+            +angular.dot(props.effective_world_inv_inertia*angular);
+        let approach=(hit.translation_remaining/dt-body.velocity_at_point(point)).dot(direction).max(0.);
+        if !inverse_mass.is_finite()||inverse_mass<=0.||!approach.is_finite(){return Err("invalid character effective contact mass".into());}
+        body.apply_impulse_at_point(direction*(approach/inverse_mass),point,true);
+    }
     let mut reactions=Vec::new();let mut unique=HashSet::new();
     for collider in dynamic{let handle=colliders[collider].parent().unwrap();if !unique.insert(handle){continue;}
         let id=*region.bodies.iter().find(|(_,h)|**h==handle).ok_or("witness dynamic body has no persistent identity")?.0;
