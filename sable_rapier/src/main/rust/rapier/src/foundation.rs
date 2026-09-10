@@ -343,6 +343,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 return Ok(vec![id as f64, 1.0]);
             }
             if op == 10 {
+                transfer::retire_scene(&mut registry,handle);
                 registry
                     .scenes
                     .remove(&handle)
@@ -614,8 +615,11 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             .local_anchor1(vec(&v, 0)?)
                             .local_anchor2(vec(&v, 3)?)
                             .contacts_enabled(false);
+                        loop {
+                            region.next_legacy_joint=region.next_legacy_joint.checked_sub(1).ok_or("legacy joint identity exhausted")?;
+                            if !region.joints.contains_key(&region.next_legacy_joint) {break;}
+                        }
                         let joint=sim.impulse_joint_set.insert(a, b, j, true);
-                        region.next_legacy_joint -= 1;
                         region.joints.insert(region.next_legacy_joint,joint);
                         Ok(vec![])
                     }

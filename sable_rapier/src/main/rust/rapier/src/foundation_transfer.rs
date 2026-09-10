@@ -59,10 +59,25 @@ pub(super) struct PreparedTransfer {
     resources:Resources, moved_bodies:usize, moved_joints:usize, moved_contacts:usize,
 }
 
+pub(super) fn retire_scene(registry:&mut Registry,scene:i64) {
+    if registry.transfer.as_ref().is_some_and(|t|t.source==scene||t.destination==scene) {
+        registry.transfer=None;
+    }
+}
+
 fn lookup<'a>(registry:&'a Registry,id:i64)->Result<&'a Region,String> {
     let scene=registry.scenes.get(&id).ok_or("stale scene handle")?;
     if scene.failed_range { return Err("failed scene cannot transfer".into()); }
     Ok(scene)
+}
+fn body_lease(region:&Region,ids:&[i64])->Result<RigidBodyHandle,String> {
+    if ids.len()!=5 || region.failed_range || region.body_epochs.get(&ids[0])!=Some(&ids[1]) || region.epoch!=ids[4] {
+        return Err("failed scene or stale body/frame ownership lease".into());
+    }
+    let handle=*region.bodies.get(&ids[0]).ok_or("unknown body")?;
+    let (slot,generation)=handle.into_raw_parts();
+    if ids[2]!=slot as i64 || ids[3]!=generation as i64 {return Err("recycled native body lease".into());}
+    Ok(handle)
 }
 fn pose(values:&[f64])->Result<Pose,String> {
     let translation=vec(values,0)?;
@@ -130,6 +145,9 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result
         }
     }
     let mut moved_joints=Vec::new();
+    if source.joints.len()!=source.sim.impulse_joint_set.len() || source.sim.multibody_joint_set.iter().next().is_some() {
+        return Err("transfer requires complete registered impulse-joint topology".into());
+    }
     for (stable,handle) in &source.joints {
         let joint=source.sim.impulse_joint_set.get(*handle).ok_or("stale source joint registry")?;
         let a=selected.contains(&joint.body1); let b=selected.contains(&joint.body2);
@@ -318,12 +336,11 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
             Ok(vec![ids[0],section.revision,section.fingerprint as i64,if section.resident{1}else{0}])
         },
         9 | 10 => {
-            if ids.len()!=2 {return Err("motion update requires body identity and ownership epoch".into());}
+            if ids.len()!=5 {return Err("motion update requires complete body/frame lease".into());}
             require(values,if op==9{13}else{7})?;let target=pose(values)?;
             let linear=if op==9{vec(values,7)?}else{Vec3::ZERO};let angular=if op==9{vec(values,10)?}else{Vec3::ZERO};
             let region=registry.scenes.get_mut(&scene).ok_or("stale scene")?;
-            if region.failed_range||region.body_epochs.get(&ids[0])!=Some(&ids[1]){return Err("failed scene or stale body ownership epoch".into());}
-            let handle=*region.bodies.get(&ids[0]).ok_or("unknown body")?;
+            let handle=body_lease(region,ids)?;
             let body=&region.sim.rigid_body_set[handle];
             if op==10&&!body.is_kinematic(){return Err("queued pose requires kinematic body".into());}
             for collider in body.colliders() {
@@ -335,9 +352,9 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
             else {body.set_position(target,true);body.set_linvel(linear,true);body.set_angvel(angular,true);}
             region.mutation+=1;Ok(vec![])
         },
-        11 => {require(values,0)?;Ok(vec![1])},
+        11 => {require(values,0)?;Ok(vec![2])},
         12 => {
-            if ids.len()!=2{return Err("body properties require identity and ownership epoch".into());}require(values,12)?;
+            if ids.len()!=5{return Err("body properties require complete body/frame lease".into());}require(values,12)?;
             if values.iter().any(|v|!v.is_finite())||values[0]<=0.||values[0]>1e9
                 ||values[1]<0.||values[1]>100.||values[2]<0.||values[2]>100.
                 ||!(values[3]==0.||values[3]==1.)||values[4]<0.||values[4]>16.
@@ -347,8 +364,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
                 return Err("invalid bounded body properties".into());
             }
             let region=registry.scenes.get_mut(&scene).ok_or("stale scene")?;
-            if region.failed_range||region.body_epochs.get(&ids[0])!=Some(&ids[1]){return Err("failed scene or stale body ownership epoch".into());}
-            let handle=*region.bodies.get(&ids[0]).ok_or("unknown body")?;
+            let handle=body_lease(region,ids)?;
             let body=&region.sim.rigid_body_set[handle];
             if body.colliders().len()!=1{return Err("property update supports one box collider".into());}
             let collider=body.colliders()[0];
