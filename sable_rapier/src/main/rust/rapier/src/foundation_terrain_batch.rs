@@ -7,7 +7,7 @@ struct Receipt { request:Vec<i64>,values:Vec<u64>,result:Vec<i64> }
 pub(super) struct State { high_water:i64,receipt:Option<Receipt> }
 
 pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->Result<Vec<i64>,String>{
-    if op==30{if !ids.is_empty(){return Err("terrain batch capability takes no identities".into());}require(values,0)?;return Ok(vec![1,MAX_BATCH as i64]);}
+    if op==30{if !ids.is_empty(){return Err("terrain batch capability takes no identities".into());}require(values,0)?;return Ok(vec![2,MAX_BATCH as i64]);}
     if op==32||op==33{
         if ids.len()!=1||ids[0]<=0{return Err("terrain batch action ID required".into());}require(values,0)?;
         let region=registry.scenes.get_mut(&scene).ok_or("stale terrain batch scene")?;
@@ -20,11 +20,12 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
         if op==32{return Ok(receipt.result.clone());}
         region.terrain_batch.receipt=None;return Ok(vec![]);
     }
-    if op!=31||ids.len()<6||ids[4]<=0||ids[5]<1||ids[5]>MAX_BATCH as i64{return Err("invalid bounded terrain batch header".into());}
+    if ![31,34].contains(&op)||ids.len()<6||ids[4]<=0||ids[5]<1||ids[5]>MAX_BATCH as i64{return Err("invalid bounded terrain batch header".into());}
     let count=ids[5] as usize;if ids.len()!=6+count*6{return Err("incomplete terrain batch identities".into());}require(values,count*3)?;
     let region=transfer::lookup(registry,scene)?;
     let value_bits:Vec<u64>=values.iter().map(|v|v.to_bits()).collect();
     if let Some(receipt)=&region.terrain_batch.receipt{
+        if op==34{return Err("terrain batch was already committed before preflight".into());}
         if receipt.request==ids&&receipt.values==value_bits{return Ok(receipt.result.clone());}
         return Err("unacknowledged terrain batch or conflicting action replay".into());
     }
@@ -67,6 +68,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
     let region=registry.scenes.get_mut(&scene).unwrap();
     region.sim.rigid_body_set.planetary_reserve_static_batch(count+wake.len());
     region.sim.collider_set.planetary_reserve_static_batch(count);
+    if op==34{return Ok(vec![scene,region.epoch,region.time_nanos,region.mutation,count as i64]);}
     // All fallible validation and bounded bookkeeping allocation precede authoritative mutation.
     // A panic poisons the registry; callers retain their fence and must not claim rollback.
     for (i,entry) in ids[6..].chunks_exact(6).enumerate(){
