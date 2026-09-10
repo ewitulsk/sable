@@ -1,10 +1,23 @@
 diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
 --- a/src/dynamics/rigid_body_set.rs
 +++ b/src/dynamics/rigid_body_set.rs
-@@ -79,6 +79,16 @@ pub struct RigidBodySet {
+@@ -79,6 +79,29 @@
  }
  
  impl RigidBodySet {
++    /// Preserve every physical field while keeping newly allocated destination links.
++    pub fn planetary_restore_imported_body(&mut self, handle: RigidBodyHandle, original: &RigidBody, delta: crate::math::Vector) {
++        let imported = self.bodies.get_mut(handle.0).unwrap();
++        let ids = imported.ids;
++        let colliders = imported.colliders.clone();
++        *imported = original.clone();
++        imported.ids = ids;
++        imported.colliders = colliders;
++        imported.pos.position.translation -= delta;
++        imported.pos.next_position.translation -= delta;
++        imported.mprops.world_com -= delta;
++        imported.changes = original.changes | RigidBodyChanges::IN_MODIFIED_SET;
++    }
 +    /// Translate a complete scene's coordinate origin without waking bodies or changing motion.
 +    /// The caller must also shift its colliders, narrow phase, and broad phase atomically.
 +    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
@@ -18,65 +31,23 @@ diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
      /// Creates a new empty collection of rigid bodies.
      ///
      /// Call this once when setting up your physics world. The collection will
-diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
---- a/src/geometry/collider_set.rs
-+++ b/src/geometry/collider_set.rs
-@@ -53,6 +53,13 @@ pub struct ColliderSet {
- }
+diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
+--- a/src/dynamics/rigid_body.rs
++++ b/src/dynamics/rigid_body.rs
+@@ -731,6 +731,14 @@
+             }
  
- impl ColliderSet {
-+    /// Shift world poses only; collider-parent transforms and modification flags are unchanged.
-+    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
-+        for (_, collider) in self.colliders.iter_mut() {
-+            collider.pos.0.translation -= delta;
+             self.forces.gravity_scale = scale;
 +        }
 +    }
 +
-     /// Creates a new empty collection of colliders.
-     pub fn new() -> Self {
-         ColliderSet {
-diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
---- a/src/geometry/narrow_phase.rs
-+++ b/src/geometry/narrow_phase.rs
-@@ -83,6 +83,15 @@ impl Default for NarrowPhase {
- }
- 
- impl NarrowPhase {
-+    /// Contact anchors/warm starts are local. Only cached solver world points translate.
-+    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
-+        for edge in &mut self.contact_graph.graph.edges {
-+            for manifold in &mut edge.weight.manifolds {
-+                for contact in &mut manifold.data.solver_contacts { contact.point -= delta; }
-+            }
-+        }
-+    }
-+
-     /// Creates a new empty narrow-phase.
-     pub fn new() -> Self {
-         Self::with_query_dispatcher(DefaultQueryDispatcher)
-diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
---- a/src/geometry/broad_phase_bvh.rs
-+++ b/src/geometry/broad_phase_bvh.rs
-@@ -53,6 +53,20 @@ pub enum BvhOptimizationStrategy {
- const ENABLE_TREE_VALIDITY_CHECK: bool = false;
- 
- impl BroadPhaseBvh {
-+    /// Rebuild the bounded scene's tree using translated existing leaf bounds, preserving pairs.
-+    /// Leaf padding/prediction and collider generations are retained; pending adds/removals stay pending.
-+    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector, colliders: &ColliderSet) {
-+        let leaves: Vec<_> = colliders.iter().filter_map(|(handle, _)| {
-+            let key = handle.into_raw_parts().0;
-+            self.tree.leaf_node(key).map(|leaf| {
-+                let aabb = leaf.aabb();
-+                (key as usize, Aabb::new(aabb.mins - delta, aabb.maxs - delta))
-+            })
-+        }).collect();
-+        self.tree = Bvh::from_iter(parry::partitioning::BvhBuildStrategy::Binned, leaves);
-+        self.workspace = BvhWorkspace::default();
-+    }
-+
-     const CHANGE_DETECTION_ENABLED: bool = true;
-     const CHANGE_DETECTION_FACTOR: Real = 1.0e-2;
++    /// Replace the gravitational field without modifying external force accumulators.
++    pub fn planetary_set_gravity(&mut self, gravity: Option<Vector>) {
++        if self.forces.planetary_gravity != gravity {
++            self.forces.planetary_gravity = gravity;
++            self.wake_up(true);
+         }
+     }
  
 diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_components.rs
 --- a/src/dynamics/rigid_body_components.rs
@@ -115,27 +86,43 @@ diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_com
          self.torque = self.user_torque;
      }
  
-diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
---- a/src/dynamics/rigid_body.rs
-+++ b/src/dynamics/rigid_body.rs
-@@ -737,5 +737,13 @@
-     }
+diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
+--- a/src/geometry/collider_set.rs
++++ b/src/geometry/collider_set.rs
+@@ -53,6 +53,27 @@
+ }
  
-+    /// Replace the gravitational field without modifying external force accumulators.
-+    pub fn planetary_set_gravity(&mut self, gravity: Option<Vector>) {
-+        if self.forces.planetary_gravity != gravity {
-+            self.forces.planetary_gravity = gravity;
-+            self.wake_up(true);
+ impl ColliderSet {
++    /// Insert a cloned collider without falsely invalidating its cached shape workspace.
++    pub fn planetary_import_collider(&mut self, original: &Collider, parent: RigidBodyHandle, bodies: &mut RigidBodySet, delta: crate::math::Vector) -> ColliderHandle {
++        let mut collider = original.clone();
++        collider.parent.as_mut().expect("imported collider requires parent").handle = parent;
++        collider.pos.0.translation -= delta;
++        let handle = ColliderHandle(self.colliders.insert(collider));
++        bodies.index_mut_internal(parent).colliders.0.push(handle);
++        // A translated import is not a user position edit. Preserve genuine pending edits only.
++        // Broad-phase insertion is performed separately by the transfer transaction.
++        if original.changes.contains(ColliderChanges::IN_MODIFIED_SET) {
++            self.modified_colliders.push_unchecked(handle, &mut self.colliders[handle.0]);
++        }
++        handle
++    }
++    /// Shift world poses only; collider-parent transforms and modification flags are unchanged.
++    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
++        for (_, collider) in self.colliders.iter_mut() {
++            collider.pos.0.translation -= delta;
 +        }
 +    }
 +
-     /// The dominance group of this rigid-body.
-     pub fn dominance_group(&self) -> i8 {
-         self.dominance.0
+     /// Creates a new empty collection of colliders.
+     pub fn new() -> Self {
+         ColliderSet {
 diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
 --- a/src/geometry/narrow_phase.rs
 +++ b/src/geometry/narrow_phase.rs
-@@ -85,1 +85,11 @@
+@@ -83,6 +83,25 @@
+ }
+ 
  impl NarrowPhase {
 +    /// Import remapped persistent contact data, including manifold workspaces and solver impulses.
 +    pub fn planetary_import_contact(&mut self, colliders: &ColliderSet, pair: ContactPair) {
@@ -147,36 +134,84 @@ diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
 +        let edge = self.contact_graph.graph.find_edge(ga, gb).unwrap();
 +        *self.contact_graph.graph.edge_weight_mut(edge).unwrap() = pair;
 +    }
-diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
---- a/src/dynamics/rigid_body_set.rs
-+++ b/src/dynamics/rigid_body_set.rs
-@@ -81,1 +81,16 @@
- impl RigidBodySet {
-+    /// Preserve every physical field while keeping newly allocated destination links.
-+    pub fn planetary_restore_imported_body(&mut self, handle: RigidBodyHandle, original: &RigidBody, delta: crate::math::Vector) {
-+        let imported = self.bodies.get_mut(handle.0).unwrap();
-+        let ids = imported.ids;
-+        let colliders = imported.colliders.clone();
-+        *imported = original.clone();
-+        imported.ids = ids;
-+        imported.colliders = colliders;
-+        imported.pos.position.translation -= delta;
-+        imported.pos.next_position.translation -= delta;
-+        imported.mprops.world_com -= delta;
-+        imported.changes = RigidBodyChanges::all();
-+        imported.changes.remove(RigidBodyChanges::LOCAL_MASS_PROPERTIES | RigidBodyChanges::COLLIDERS);
-+        imported.activation.sleep_root_state = crate::dynamics::SleepRootState::Unknown;
++    /// Contact anchors/warm starts are local. Only cached solver world points translate.
++    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
++        for edge in &mut self.contact_graph.graph.edges {
++            for manifold in &mut edge.weight.manifolds {
++                for contact in &mut manifold.data.solver_contacts { contact.point -= delta; }
++            }
++        }
 +    }
-diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
---- a/src/geometry/collider_set.rs
-+++ b/src/geometry/collider_set.rs
-@@ -55,1 +55,9 @@
- impl ColliderSet {
-+    /// Insert a cloned collider without falsely invalidating its cached shape workspace.
-+    pub fn planetary_import_collider(&mut self, original: &Collider, parent: RigidBodyHandle, bodies: &mut RigidBodySet, delta: crate::math::Vector) -> ColliderHandle {
-+        let handle = self.insert_with_parent(original.clone(), parent, bodies);
-+        let collider = self.colliders.get_mut(handle.0).unwrap();
-+        collider.pos.0.translation = original.pos.0.translation - delta;
-+        collider.changes = ColliderChanges::POSITION | ColliderChanges::IN_MODIFIED_SET;
-+        handle
++
+     /// Creates a new empty narrow-phase.
+     pub fn new() -> Self {
+         Self::with_query_dispatcher(DefaultQueryDispatcher)
+diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
+--- a/src/geometry/broad_phase_bvh.rs
++++ b/src/geometry/broad_phase_bvh.rs
+@@ -53,6 +53,28 @@
+ const ENABLE_TREE_VALIDITY_CHECK: bool = false;
+ 
+ impl BroadPhaseBvh {
++    /// Preserve a transferred collider's padded/predicted leaf without flagging a user edit.
++    pub fn planetary_import_leaf(&mut self, source: &Self, old: ColliderHandle, new: ColliderHandle, delta: crate::math::Vector) {
++        if let Some(leaf) = source.tree.leaf_node(old.into_raw_parts().0) {
++            let aabb = leaf.aabb();
++            self.tree.insert_with_change_detection(Aabb::new(aabb.mins - delta, aabb.maxs - delta), new.into_raw_parts().0, 0.0);
++        }
 +    }
++
++    /// Rebuild the bounded scene's tree using translated existing leaf bounds, preserving pairs.
++    /// Leaf padding/prediction and collider generations are retained; pending adds/removals stay pending.
++    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector, colliders: &ColliderSet) {
++        let leaves: Vec<_> = colliders.iter().filter_map(|(handle, _)| {
++            let key = handle.into_raw_parts().0;
++            self.tree.leaf_node(key).map(|leaf| {
++                let aabb = leaf.aabb();
++                (key as usize, Aabb::new(aabb.mins - delta, aabb.maxs - delta))
++            })
++        }).collect();
++        self.tree = Bvh::from_iter(parry::partitioning::BvhBuildStrategy::Binned, leaves);
++        self.workspace = BvhWorkspace::default();
++    }
++
+     const CHANGE_DETECTION_ENABLED: bool = true;
+     const CHANGE_DETECTION_FACTOR: Real = 1.0e-2;
+ 
+diff --git a/src/dynamics/island_manager/manager.rs b/src/dynamics/island_manager/manager.rs
+--- a/src/dynamics/island_manager/manager.rs
++++ b/src/dynamics/island_manager/manager.rs
+@@ -47,6 +47,33 @@
+ }
+ 
+ impl IslandManager {
++    /// Import source island membership in source order, retaining sleep components and candidates.
++    /// The caller has already proved that active contacts/joints cannot cross the selected group.
++    pub fn planetary_import_islands(&mut self, source: &Self, bodies: &mut RigidBodySet, remap: &[(RigidBodyHandle, RigidBodyHandle)]) {
++        let mapped = |old: RigidBodyHandle| remap.iter().find(|(a, _)| *a == old).map(|(_, b)| *b);
++        for (_, original) in source.islands.iter() {
++            let handles: Vec<_> = original.bodies.iter().filter_map(|h| mapped(*h)).collect();
++            if handles.is_empty() { continue; }
++            let mut imported = original.clone();
++            imported.bodies = handles;
++            let id = self.free_islands.pop().unwrap_or(self.islands.len());
++            imported.id_in_awake_list = if original.is_sleeping() { None } else {
++                let awake = self.awake_islands.len(); self.awake_islands.push(id); Some(awake)
++            };
++            for (index, handle) in imported.bodies.iter().enumerate() {
++                let rb = bodies.index_mut_internal(*handle);
++                rb.ids.active_island_id = id;
++                rb.ids.active_set_id = index;
++                // Timestamp is a destination traversal marker, not transferable physical state.
++                rb.ids.active_set_timestamp = self.traversal_timestamp.wrapping_sub(1);
++            }
++            self.islands.insert(id, imported);
++        }
++        for candidate in &source.traversal_candidates {
++            if let Some(handle) = mapped(candidate.0) { self.traversal_candidates.push_back(SleepCandidate(handle)); }
++        }
++    }
++
+     /// Creates a new empty island manager.
+     pub fn new() -> Self {
+         Self::default()

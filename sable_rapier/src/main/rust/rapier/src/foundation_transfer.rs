@@ -209,12 +209,15 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result
         let new=destination_sim.rigid_body_set.insert(original.clone()); body_remap.insert(old,new);
         for collider in original.colliders() {
             let new_collider=destination_sim.collider_set.planetary_import_collider(&source.sim.collider_set[*collider],new,&mut destination_sim.rigid_body_set,delta);
+            destination_sim.broad_phase.planetary_import_leaf(&source.sim.broad_phase,*collider,new_collider,delta);
             collider_remap.insert(*collider,new_collider);
         }
         destination_sim.rigid_body_set.planetary_restore_imported_body(new,original,delta);
         destination_bodies.insert(*stable,new);source_bodies.remove(stable);
         destination_epochs.insert(*stable,source_epochs.remove(stable).ok_or("missing source ownership epoch")?.checked_add(1).ok_or("ownership epoch exhausted")?);
     }
+    let island_remap:Vec<_>=selected.iter().map(|old|(*old,body_remap[old])).collect();
+    destination_sim.island_manager.planetary_import_islands(&source.sim.island_manager,&mut destination_sim.rigid_body_set,&island_remap);
     for (stable,original) in &moved_joints {
         let joint=destination_sim.impulse_joint_set.insert(body_remap[&original.body1],body_remap[&original.body2],original.data,false);
         destination_sim.impulse_joint_set.get_mut(joint,false).unwrap().impulses=original.impulses;
