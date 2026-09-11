@@ -17,6 +17,8 @@ mod character;
 mod time;
 #[path = "foundation_controlled.rs"]
 mod controlled;
+#[path = "foundation_controlled_pose.rs"]
+mod controlled_pose;
 #[path = "foundation_terrain_batch.rs"]
 mod terrain_batch;
 #[path = "foundation_preview.rs"]

@@ -8,6 +8,9 @@ const MAX_PLAYERS: usize = 8;
 const MAX_ITEMS: usize = 64;
 const MAX_CONTACTS: usize = 64;
 const MAX_SPEED: f64 = 320.;
+const MAX_MOTOR_SEGMENTS: usize = 42;
+#[derive(Clone)]
+struct MotorSegment { end: i64, velocity: Vec3 }
 // Local accuracy cost for islands touching an actor; existing error tolerances are unchanged.
 const ADDITIONAL_SOLVER_ITERATIONS: usize = 8;
 #[derive(Clone)]
@@ -18,6 +21,9 @@ struct Input {
     velocity: Vec3,
     started: bool,
     initial_velocity: Vec3,
+    segments: Vec<MotorSegment>,
+    active_segment: usize,
+    applied_motor_delta: Vec3,
     // Actual force events from all CCD subdivisions; never endpoint support contacts.
     events: Vec<[i64; 16]>,
 }
@@ -265,6 +271,23 @@ fn actor<'a>(registry: &'a Registry, scene: i64, ids: &[i64]) -> Result<&'a Acto
     }
     Ok(a)
 }
+/// Narrow read-only authority seam for candidate feet-anchored PLAYER shape operations.
+/// Caller still owns staged-scene admission and the actual validated native mutation.
+pub(super) fn pose_actor(registry: &Registry, scene: i64, ids: &[i64]) -> Result<(i64, f64, Vec<i64>), String> {
+    if ids.len() != 7 { return Err("anchored pose requires exact actor lease".into()); }
+    let a = actor(registry, scene, ids)?;
+    if a.kind != 1 || a.input.is_some() || a.result.is_some() {
+        return Err("anchored pose requires idle exact PLAYER actor".into());
+    }
+    Ok((a.body, a.mass, identity(transfer::lookup(registry, scene)?, a)))
+}
+pub(super) fn pose_publish_identity(registry: &Registry, scene: i64, id: i64) -> Result<Vec<i64>, String> {
+    let a = registry.controlled.actors.get(&id).ok_or("anchored pose actor absent")?;
+    if a.scene != scene || a.kind != 1 || a.input.is_some() || a.result.is_some() {
+        return Err("anchored pose actor owner or pending state changed".into());
+    }
+    Ok(identity(transfer::lookup(registry, scene)?, a))
+}
 fn same_pose(a: &Pose, b: &Pose) -> bool {
     (a.translation - b.translation).length() <= 1e-9
         && (1. - a.rotation.dot(b.rotation).abs()).abs() <= 1e-10
@@ -366,25 +389,41 @@ pub(super) fn before_step(registry: &mut Registry, scene: i64, nanos: i64) -> Re
         {
             return Err("controlled actor dynamics changed outside its owner".into());
         }
-        if !input.started {
-            start.push((a.id, a.body, input.velocity));
+        let segment = if input.segments.is_empty() { 0 } else {
+            input.segments.iter().position(|segment| segment.end > region.time_nanos)
+                .ok_or("segmented input has no remaining motor interval")?
+        };
+        if !input.segments.is_empty() && next > input.segments[segment].end {
+            return Err("native step crosses a controlled motor segment boundary".into());
+        }
+        let boundary = !input.started || segment != input.active_segment;
+        if boundary {
+            if input.started && (segment != input.active_segment + 1
+                || region.time_nanos != input.segments[input.active_segment].end) {
+                return Err("controlled motor skipped its exact boundary".into());
+            }
+            let drive = if input.segments.is_empty() { input.velocity } else { input.segments[segment].velocity };
+            let delta = if input.started { drive - input.segments[input.active_segment].velocity } else { Vec3::ZERO };
+            // First drive is total desired velocity. Later drives preserve this input's
+            // external response. The delta itself may be 640 m/s for opposite legal drives.
+            let velocity = if input.started { body.linvel() + delta } else { drive };
+            if !velocity.is_finite() || velocity.length() > MAX_SPEED {
+                return Err("segmented motor plus retained reaction exceeds admitted speed".into());
+            }
+            start.push((a.id, a.body, velocity, delta, segment, !input.started));
         }
     }
+    // No motor is written until every actor's next boundary and velocity is admitted.
     let region = registry.scenes.get_mut(&scene).unwrap();
-    for (id, key, velocity) in start {
+    for (id, key, velocity, delta, segment, first) in start {
         let body = &mut region.sim.rigid_body_set[region.bodies[&key]];
         body.set_linvel(velocity, true);
-        body.set_angvel(Vec3::ZERO, true);
-        let input = registry
-            .controlled
-            .actors
-            .get_mut(&id)
-            .unwrap()
-            .input
-            .as_mut()
-            .unwrap();
+        if first { body.set_angvel(Vec3::ZERO, true); }
+        let input = registry.controlled.actors.get_mut(&id).unwrap().input.as_mut().unwrap();
+        if first { input.initial_velocity = velocity; }
+        input.applied_motor_delta += delta;
+        input.active_segment = segment;
         input.started = true;
-        input.initial_velocity = velocity;
     }
     Ok(())
 }
@@ -416,7 +455,7 @@ pub(super) fn after_step(registry: &mut Registry, scene: i64) -> Result<(), Stri
                 "controlled actor solver velocity escaped its admitted speed envelope".into(),
             );
         }
-        let impulse = (velocity - input.initial_velocity) * a.mass;
+        let impulse = (velocity - input.initial_velocity - input.applied_motor_delta) * a.mass;
         if !impulse.is_finite() {
             return Err("invalid controlled actor momentum receipt".into());
         }
@@ -508,10 +547,81 @@ pub(super) fn dispatch(
     ids: &[i64],
     values: &[f64],
 ) -> Result<Vec<i64>, String> {
-    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58) {
+    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77) {
         return Err("controlled actor mutation forbidden during transfer staging".into());
     }
     match op {
+        74 => {
+            if !ids.is_empty() { return Err("segmented capability takes no identities".into()); }
+            require(values, 0)?;
+            Ok(vec![1, MAX_MOTOR_SEGMENTS as i64, 53, 136, bits(MAX_SPEED)])
+        }
+        75 => {
+            if ids.len() < 12 || ids[10] < 1 || ids[10] > MAX_MOTOR_SEGMENTS as i64
+                || ids.len() != 11 + ids[10] as usize {
+                return Err("segmented input requires bounded complete motor intervals".into());
+            }
+            let count = ids[10] as usize;
+            require(values, 10 + 3 * count)?;
+            let a = actor(registry, scene, ids)?;
+            let region = transfer::lookup(registry, scene)?;
+            let pose = transfer::pose(values)?;
+            let expected_velocity = vec(values, 7)?;
+            let duration = ids[9].checked_sub(ids[8]).ok_or("segmented duration overflow")?;
+            if a.input.is_some() || a.result.is_some() || ids[7] <= a.last_sequence
+                || ids[8] != region.time_nanos
+                || ![12_500_000, 25_000_000, 50_000_000].contains(&duration) {
+                return Err("segmented input stale, pending or outside fixed interval".into());
+            }
+            let body = actor_body(region, a)?;
+            if !same_pose(body.position(), &pose) || body.linvel() != expected_velocity {
+                return Err("segmented input initial actual pose/velocity CAS mismatch".into());
+            }
+            let mut segments = Vec::with_capacity(count);
+            let mut previous = ids[8];
+            for index in 0..count {
+                let end = ids[11 + index];
+                let velocity = vec(values, 10 + index * 3)?;
+                if end <= previous || end > ids[9] || velocity.length() > MAX_SPEED {
+                    return Err("segmented input interval ordering or motor speed bound".into());
+                }
+                segments.push(MotorSegment { end, velocity });
+                previous = end;
+            }
+            if previous != ids[9] { return Err("segmented input does not cover exact full interval".into()); }
+            let velocity = segments[0].velocity;
+            registry.controlled.actors.get_mut(&ids[0]).unwrap().input = Some(Input {
+                sequence: ids[7], start: ids[8], end: ids[9], velocity,
+                started: false, initial_velocity: velocity, segments, active_segment: 0,
+                applied_motor_delta: Vec3::ZERO, events: Vec::with_capacity(MAX_CONTACTS),
+            });
+            Ok(vec![ids[7], ids[8], ids[9]])
+        }
+        76 => {
+            if !ids.is_empty() { return Err("next motor boundary takes no identities".into()); }
+            require(values, 0)?;
+            let now = transfer::lookup(registry, scene)?.time_nanos;
+            let next = registry.controlled.actors.values().filter(|a| a.scene == scene)
+                .filter_map(|a| a.input.as_ref()).filter_map(|input| {
+                    if input.segments.is_empty() { (input.end > now).then_some(input.end) }
+                    else { input.segments.iter().find(|segment| segment.end > now).map(|segment| segment.end) }
+                }).min().unwrap_or(now);
+            Ok(vec![now, next])
+        }
+        77 => {
+            if ids.len() != 7 { return Err("motor state requires exact actor lease".into()); }
+            require(values, 0)?;
+            let a = actor(registry, scene, ids)?;
+            let region = transfer::lookup(registry, scene)?;
+            let body = actor_body(region, a)?;
+            let pose = body.position();
+            let mut out = identity(region, a);
+            out.extend(vector_bits(pose.translation));
+            out.extend([bits(pose.rotation.x),bits(pose.rotation.y),bits(pose.rotation.z),bits(pose.rotation.w)]);
+            out.extend(vector_bits(body.linvel()));
+            out.extend([a.input.is_some() as i64,a.result.is_some() as i64]);
+            Ok(out)
+        }
         57 => {
             if !ids.is_empty() { return Err("interval contact capability takes no identities".into()); }
             require(values,0)?;
@@ -702,6 +812,9 @@ pub(super) fn dispatch(
                 velocity,
                 started: false,
                 initial_velocity: velocity,
+                segments: Vec::new(),
+                active_segment: 0,
+                applied_motor_delta: Vec3::ZERO,
                 events: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])

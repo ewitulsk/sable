@@ -404,7 +404,7 @@ index 19d4c25..88b5644 100644
      ///
      /// Call this once when setting up your physics world. The collection will
 diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
-index 0f4ef43..9d49b1b 100644
+index 0f4ef43..5854260 100644
 --- a/src/dynamics/rigid_body.rs
 +++ b/src/dynamics/rigid_body.rs
 @@ -18,6 +18,62 @@ use crate::utils::CrossProduct;
@@ -479,7 +479,7 @@ index 0f4ef43..9d49b1b 100644
      /// User-defined data associated to this rigid-body.
      pub user_data: u128,
  }
-@@ -76,6 +134,36 @@ impl Default for RigidBody {
+@@ -76,6 +134,51 @@ impl Default for RigidBody {
  }
  
  impl RigidBody {
@@ -500,6 +500,21 @@ index 0f4ef43..9d49b1b 100644
 +        trace
 +    }
 +    pub fn planetary_end_sweep(&mut self) -> Option<PlanetarySweepTrace> { self.planetary_sweep.take() }
++    /// A checked staged pose/shape transition may enlarge its collector without erasing any
++    /// prior motion. The caller supplies the full continuous transition/query envelope and a
++    /// radius enclosing the new collider. Existing solver trace copies retain their old radius;
++    /// only future solver captures use the enlarged one. The center of mass must stay fixed.
++    pub fn planetary_expand_sweep(&mut self, radius: Real, envelope: &crate::geometry::Aabb) -> Result<(), &'static str> {
++        let trace=self.planetary_sweep.as_mut().ok_or("pose transition requires an active staged sweep")?;
++        if !radius.is_finite() || radius<0.0 || trace.local_com!=self.mprops.local_mprops.local_com {
++            return Err("pose transition changed sweep center or supplied an invalid radius");
++        }
++        trace.snapshot()?;
++        trace.radius=trace.radius.max(radius);
++        trace.record_bounds(envelope.mins,envelope.maxs,4);
++        trace.snapshot()?;
++        Ok(())
++    }
 +    pub(crate) fn planetary_validate_sweep_mass(&self) {
 +        if let Some(trace) = &self.planetary_sweep {
 +            if trace.local_com != self.mprops.local_mprops.local_com {
@@ -516,7 +531,7 @@ index 0f4ef43..9d49b1b 100644
      fn new() -> Self {
          Self {
              pos: RigidBodyPosition::default(),
-@@ -94,6 +182,7 @@ impl RigidBody {
+@@ -94,6 +197,7 @@ impl RigidBody {
              enabled: true,
              user_data: 0,
              additional_solver_iterations: 0,
@@ -524,7 +539,7 @@ index 0f4ef43..9d49b1b 100644
          }
      }
  
-@@ -137,6 +226,7 @@ impl RigidBody {
+@@ -137,6 +241,7 @@ impl RigidBody {
              dominance,
              enabled,
              additional_solver_iterations,
@@ -532,7 +547,7 @@ index 0f4ef43..9d49b1b 100644
              user_data,
          } = other;
  
-@@ -152,6 +242,7 @@ impl RigidBody {
+@@ -152,6 +257,7 @@ impl RigidBody {
          self.dominance = *dominance;
          self.enabled = *enabled;
          self.additional_solver_iterations = *additional_solver_iterations;
@@ -540,7 +555,7 @@ index 0f4ef43..9d49b1b 100644
          self.user_data = *user_data;
  
          self.changes = RigidBodyChanges::all();
-@@ -555,6 +646,7 @@ impl RigidBody {
+@@ -555,6 +661,7 @@ impl RigidBody {
              self.body_type,
              &self.pos.position,
          );
@@ -548,7 +563,7 @@ index 0f4ef43..9d49b1b 100644
      }
  
      /// Adds extra mass on top of collider-computed mass.
-@@ -734,6 +826,21 @@ impl RigidBody {
+@@ -734,6 +841,21 @@ impl RigidBody {
          }
      }
  
