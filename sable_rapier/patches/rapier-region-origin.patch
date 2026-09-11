@@ -222,7 +222,7 @@ diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
 diff --git a/src/dynamics/island_manager/manager.rs b/src/dynamics/island_manager/manager.rs
 --- a/src/dynamics/island_manager/manager.rs
 +++ b/src/dynamics/island_manager/manager.rs
-@@ -47,6 +47,33 @@ pub struct IslandManager {
+@@ -47,6 +47,33 @@
  }
  
  impl IslandManager {
@@ -256,6 +256,16 @@ diff --git a/src/dynamics/island_manager/manager.rs b/src/dynamics/island_manage
      /// Creates a new empty island manager.
      pub fn new() -> Self {
          Self::default()
+@@ -192,6 +219,9 @@
+                 rb.ids.active_island_id = id;
+                 rb.ids.active_set_id = target_island.bodies.len();
+                 target_island.bodies.push(handle);
++                // Preserve the strongest accuracy request when reusing a small awake island.
++                target_island.additional_solver_iterations = target_island
++                    .additional_solver_iterations.max(rb.additional_solver_iterations);
+             } else {
+                 let mut new_island = Island::singleton(handle, rb);
+                 let id = self.free_islands.pop().unwrap_or(self.islands.len());
 diff --git a/src/data/modified_objects.rs b/src/data/modified_objects.rs
 --- a/src/data/modified_objects.rs
 +++ b/src/data/modified_objects.rs
