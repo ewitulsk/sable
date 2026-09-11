@@ -593,6 +593,7 @@ pub(super) fn dispatch(
                 .checked_add(1)
                 .ok_or("controlled registration exhausted")?;
             let key = BODY_ID_BASE + ids[0];
+            transfer::admit_structural(registry,1,1,0)?;
             let region = registry
                 .scenes
                 .get_mut(&scene)

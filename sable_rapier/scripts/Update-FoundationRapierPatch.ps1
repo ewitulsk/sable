@@ -10,7 +10,7 @@ if ((& git -C $reference rev-parse HEAD).Trim() -ne $revision -or @(& git -C $re
 }
 $paths = @([regex]::Matches([IO.File]::ReadAllText($patchPath), '(?m)^diff --git a/(\S+) b/\S+\r?$') | ForEach-Object { $_.Groups[1].Value })
 $paths += @('src/dynamics/mod.rs','src/dynamics/solver/solver_body.rs','src/dynamics/solver/velocity_solver.rs',
-    'src/dynamics/ccd/ccd_solver.rs','src/dynamics/ccd/toi_entry.rs','src/geometry/broad_phase_bvh.rs','src/geometry/collider.rs','src/pipeline/physics_pipeline.rs','src/pipeline/user_changes.rs')
+    'src/dynamics/ccd/ccd_solver.rs','src/dynamics/ccd/toi_entry.rs','src/geometry/broad_phase_bvh.rs','src/geometry/collider.rs','src/geometry/mod.rs','src/pipeline/physics_pipeline.rs','src/pipeline/user_changes.rs')
 $lines = [Collections.Generic.List[string]]::new()
 $expected = @{}
 foreach ($path in ($paths | Sort-Object -Unique)) {

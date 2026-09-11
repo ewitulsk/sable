@@ -91,6 +91,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
     let mut positions=Vec::with_capacity(count);let mut result=Vec::with_capacity(7+count*4);
     result.extend([scene,region.epoch,region.time_nanos,region.mutation,mutation,ids[4],count as i64]);
     let mut old_parts=0usize;let mut new_parts=0usize;
+    let mut new_instances=0usize;
     let mut wake=HashSet::new();
     let mut body_candidates=0usize;let mut contact_parts=0usize;
     for (i,entry) in ids[6..].chunks_exact(6).enumerate(){
@@ -100,6 +101,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
         if old.body.is_some()!=old.collider.is_some(){return Err("inconsistent terrain collider ownership".into());}
         if let Some(handle)=old.body{if !region.sim.rigid_body_set.get(handle).is_some_and(|b|b.is_fixed()&&b.colliders()==[old.collider.unwrap()]){return Err("terrain section is not an isolated fixed collider".into());}}
         let shape=prepared.shapes.get(&entry[5]).ok_or("retired prepared geometry")?;
+        if old.body.is_none()&&shape.shape.is_some(){new_instances+=1;}
         let position=vec(values,i*3)?;bounded(position+Vec3::splat(16.))?;
         preflight_bodies(region,old,shape,position,&mut body_candidates,&mut contact_parts)?;
         if old.fingerprint!=shape.fingerprint||old.translation!=position{
@@ -118,6 +120,9 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
     // no second allocation/reservation is charged for their installation.
     let live=LIVE_PARTS.load(Ordering::Acquire);
     if old_parts>live||new_parts>MAX_TOTAL_PARTS||live-old_parts>MAX_TOTAL_PARTS||region.sections.len()>MAX_SECTIONS{return Err("terrain replacement net capacity exceeded".into());}
+    // Existing nonempty replacements retain their actual body/collider identities. Empty-to-
+    // nonempty rows allocate; charge every such row before any removal or prepared consumption.
+    transfer::admit_structural(registry,new_instances,new_instances,0)?;
     let receipt=Receipt{request:ids.to_vec(),values:value_bits,result:result.clone()};
     let region=registry.scenes.get_mut(&scene).unwrap();
     region.sim.rigid_body_set.planetary_reserve_static_batch(count+wake.len());

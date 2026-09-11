@@ -3,19 +3,26 @@
 use super::*;
 use std::collections::{BTreeSet, HashSet};
 use rapier3d_f64::dynamics::PlanetarySweepTrace;
+use rapier3d_f64::geometry::PlanetaryContactGuard;
 
 const MAX_BODIES:usize=4096;
 const MAX_CELLS:usize=4096;
 const MAX_INTERVAL:i64=50_000_000;
 const MAX_COMMANDS:usize=4096;
+pub(super) struct Terminal { operation:i32, header:Vec<i64> }
 pub(super) struct Preview {
     id:i64, scene:i64, frame:i64, start:i64, end:i64, mutation:i64,
     state:i64, commands:usize, candidate:Option<Box<Registry>>,
     traces:Vec<(i64,i64,RigidBodyHandle,PlanetarySweepTrace)>,
     coverage:Vec<i64>, missing:Vec<Vec3>,
+    contact_guard:Option<PlanetaryContactGuard>,
 }
 pub(super) fn retains(registry:&Registry,scene:i64)->bool {
     registry.preview.as_ref().is_some_and(|p|p.scene==scene)
+}
+pub(super) fn candidate_sim(registry:&Registry)->Option<&Simulation> {
+    let preview=registry.preview.as_ref()?;
+    preview.candidate.as_ref()?.scenes.get(&preview.scene).map(|r|&r.sim)
 }
 impl Preview {
     fn header(&self)->Vec<i64> { vec![self.id,self.scene,self.frame,self.start,self.end,self.mutation,
@@ -106,7 +113,7 @@ fn begin(registry:&mut Registry,scene:i64,ids:&[i64])->Result<Vec<i64>,String> {
     staged.scenes.insert(scene,candidate);
     let id=registry.next_preview.checked_add(1).ok_or("staged interval identity exhausted")?;
     let p=Preview {id,scene,frame:source.epoch,start:source.time_nanos,end:ids[4],mutation:source.mutation,
-        state:0,commands:0,candidate:Some(Box::new(staged)),traces,coverage:vec![],missing:vec![]};
+        state:0,commands:0,candidate:Some(Box::new(staged)),traces,coverage:vec![],missing:vec![],contact_guard:None};
     let result=p.header();registry.next_preview=id;registry.preview=Some(p);Ok(result)
 }
 
@@ -152,6 +159,7 @@ fn seal(p:&mut Preview)->Result<Vec<i64>,String> {
     let r=transfer::lookup(p.candidate.as_ref().unwrap(),p.scene)?;
     if r.time_nanos!=p.end {return Err("staged interval must reach exact requested end before seal".into());}
     controlled::preview_complete(p.candidate.as_ref().unwrap(),p.scene)?;
+    p.contact_guard.as_ref().ok_or("staged interval lacks contact allocation admission")?.snapshot()?;
     let origin=r.sections.values().filter(|s|s.resident).min_by_key(|s|(s.translation.x.to_bits(),s.translation.y.to_bits(),s.translation.z.to_bits()))
         .ok_or("preview requires resident terrain lattice")?.translation;
     let mut resident=HashSet::new();
@@ -183,6 +191,23 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
     if op!=63 {require(values,0)?;}
     if op==61 {return begin(registry,scene,ids);}
     if ids.is_empty(){return Err("staged operation requires exact token".into());}
+    if matches!(op,67|68|69)&&ids.len()==1 {
+        if let Some(done)=registry.preview_terminal.get(&scene) {
+            if done.header[0]==ids[0] {
+                if op==67 {return Ok(done.header.clone());}
+                if op==done.operation {return Ok(vec![ids[0]]);}
+                return Err("staged terminal receipt has a different disposition".into());
+            }
+        }
+    }
+    if op==67&&ids.len()==5&&!retains(registry,scene) {
+        let actual=transfer::lookup(registry,scene)?;
+        if ids[..4]!=[scene,actual.epoch,actual.time_nanos,actual.mutation]||ids[4]<=actual.time_nanos
+            ||ids[4].checked_sub(actual.time_nanos).is_none_or(|n|n>MAX_INTERVAL) {
+            return Err("staged begin absence cannot be proved against changed source".into());
+        }
+        return Ok(vec![]);
+    }
     let p=registry.preview.as_ref().ok_or("staged interval absent")?;
     // A lost begin response must be recoverable without guessing its newly allocated token.
     // The exact captured owner/clock/end tuple identifies the single retained preparation.
@@ -208,29 +233,37 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
             if ids.len()!=2 {return Err("staged step requires token and nanoseconds".into());}
             let p=registry.preview.as_mut().unwrap();p.open()?;
             if p.commands>=MAX_COMMANDS{return Err("staged step command bound".into());}
-            let c=p.candidate.as_mut().unwrap();
+            let c=p.candidate.as_ref().unwrap();
             let now=transfer::lookup(c,scene)?.time_nanos;
             if ids[1]<=0||now.checked_add(ids[1]).is_none_or(|t|t>p.end){return Err("staged step exceeds reserved interval".into());}
             p.commands+=1;
-            if let Err(e)=advance_region(c,scene,ids[1]){p.state=3;return Err(e);}
-            // Reject and discard an oversized candidate immediately after each native step.
-            // This bounds retained overflow, not transient contact allocation within the
-            // solver. A pre-allocation contact budget remains required before activation.
-            let candidate=p.candidate.take().unwrap();
-            if let Err(e)=transfer::preview_budget(registry,&candidate.scenes[&scene].sim) {
-                let p=registry.preview.as_mut().unwrap();p.state=3;p.candidate=None;
-                return Err(e);
+            if let Some(guard)=&p.contact_guard {guard.snapshot()?;}
+            let mut candidate=p.candidate.take().unwrap();
+            let result=(||->Result<PlanetaryContactGuard,String>{
+                // Recompute the ceiling while the registry lock excludes every competing
+                // allocation. Original source and other retained clones still count.
+                let guard=PlanetaryContactGuard::new(transfer::remaining_contact_budget(registry,None)?);
+                let sim=&mut candidate.scenes.get_mut(&scene).unwrap().sim;
+                sim.narrow_phase.planetary_clear_contact_guard();
+                sim.narrow_phase.planetary_guard_contacts(&sim.collider_set,&guard)?;
+                advance_region(&mut candidate,scene,ids[1])?;guard.snapshot()?;
+                transfer::preview_budget(registry,&candidate.scenes[&scene].sim)?;
+                Ok(guard)
+            })();
+            match result {
+                Ok(guard)=>{let p=registry.preview.as_mut().unwrap();p.contact_guard=Some(guard);p.candidate=Some(candidate);},
+                Err(e)=>{registry.preview.as_mut().unwrap().state=3;return Err(e);},
             }
-            registry.preview.as_mut().unwrap().candidate=Some(candidate);
             Ok(registry.preview.as_ref().unwrap().header())
         },
-        65=>seal(registry.preview.as_mut().unwrap()),
+        65=>{if p.state==1{return p.snapshot();}seal(registry.preview.as_mut().unwrap())},
         66=>{
             if p.state==2{return Ok(p.header());}
             if p.state!=1||!p.missing.is_empty(){return Err("staged commit requires sealed complete collision terrain".into());}
             let r=transfer::lookup(registry,scene)?;
             if r.epoch!=p.frame||r.time_nanos!=p.start||r.mutation!=p.mutation {return Err("staged source clock changed before commit".into());}
             let c=p.candidate.as_ref().unwrap();let staged=transfer::lookup(c,scene)?;
+            p.contact_guard.as_ref().ok_or("staged contact guard missing")?.snapshot()?;
             transfer::preview_budget(registry,&staged.sim)?;
             let p=registry.preview.as_mut().unwrap();
             let mut candidate=p.candidate.take().unwrap();
@@ -238,13 +271,21 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
             for (_,_,h,_) in &p.traces {ready.sim.rigid_body_set[*h].planetary_end_sweep();}
             // PhysicsPipeline owns reusable scratch only. Retire solver-held Arc traces too.
             ready.sim.pipeline=PhysicsPipeline::new();
+            ready.sim.narrow_phase.planetary_clear_contact_guard();
             registry.scenes.insert(scene,ready);
             controlled::publish_scene(&mut registry.controlled,scene,candidate.controlled);
             p.state=2;Ok(p.header())
         },
         67=>Ok(p.header()),
-        68=>{if p.state!=2{return Err("only committed staged receipt can be acknowledged".into());}registry.preview=None;Ok(vec![ids[0]])},
-        69=>{if p.state==2{return Err("committed interval cannot abort".into());}registry.preview=None;Ok(vec![ids[0]])},
+        68|69=>{
+            if op==68&&p.state!=2{return Err("only committed staged receipt can be acknowledged".into());}
+            if op==69&&p.state==2{return Err("committed interval cannot abort".into());}
+            let mut header=p.header();header[6]=if op==68{4}else{5};
+            // At most one terminal receipt per live scene. Java retains the outer interval
+            // through this boundary, so a lost reply can retry its exact disposition.
+            registry.preview_terminal.insert(scene,Terminal{operation:op,header});
+            registry.preview=None;Ok(vec![ids[0]])
+        },
         _=>Err("unknown staged interval operation".into()),
     }
 }

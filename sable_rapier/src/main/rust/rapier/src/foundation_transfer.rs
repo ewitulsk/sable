@@ -21,11 +21,18 @@ impl Resources {
             result.pairs+=1; result.manifolds+=pair.manifolds.len();
             result.points+=pair.manifolds.iter().map(|m|m.points.len()+m.data.solver_contacts.len()).sum::<usize>();
         }
+        // A failed or idle guard may retain workspace beyond the current manifold cache.
+        // Other scenes cannot spend that reservation until its exact owner releases it.
+        if let Some(reserved)=sim.narrow_phase.planetary_contact_reservation() {
+            result.pairs=result.pairs.max(reserved.pairs);
+            result.manifolds=result.manifolds.max(reserved.manifolds);
+            result.points=result.points.max(reserved.points);
+        }
         result
     }
     fn add(&mut self,other:Self) {
-        self.bodies+=other.bodies; self.colliders+=other.colliders; self.joints+=other.joints;
-        self.pairs+=other.pairs; self.manifolds+=other.manifolds; self.points+=other.points;
+        self.bodies=self.bodies.saturating_add(other.bodies); self.colliders=self.colliders.saturating_add(other.colliders); self.joints=self.joints.saturating_add(other.joints);
+        self.pairs=self.pairs.saturating_add(other.pairs); self.manifolds=self.manifolds.saturating_add(other.manifolds); self.points=self.points.saturating_add(other.points);
     }
     fn bounded(self)->Result<(),String> {
         if self.bodies>MAX_BODY_INSTANCES || self.colliders>MAX_COLLIDER_INSTANCES
@@ -39,13 +46,43 @@ impl Resources {
         self.pairs as i64,self.manifolds as i64,self.points as i64] }
 }
 
+/// Every retained physical allocation is charged, including clones whose authoritative scene
+/// is paused. Excluding a scene excludes only its live simulation, never its retained clone.
+fn retained_resources(registry:&Registry,exclude_scene:Option<i64>)->Resources {
+    let mut total=Resources::default();
+    for (id,scene) in &registry.scenes {if Some(*id)!=exclude_scene {total.add(Resources::scene(&scene.sim));}}
+    if let Some(transfer)=&registry.transfer {total.add(transfer.resources);}
+    if let Some(candidate)=preview::candidate_sim(registry) {total.add(Resources::scene(candidate));}
+    total
+}
+
+/// Called before inserting bodies, colliders or joints, while the registry lock still owns
+/// admission. Delta includes temporary replacement overlap; removal is not assumed in advance.
+pub(super) fn admit_structural(registry:&Registry,bodies:usize,colliders:usize,joints:usize)->Result<(),String> {
+    let mut total=retained_resources(registry,None);
+    total.add(Resources {bodies,colliders,joints,..Resources::default()});total.bounded()
+}
+
+/// The guarded simulation itself is charged by its contact guard. For a detached candidate,
+/// exclude no authoritative scene and remove that candidate from Preview before this call.
+pub(super) fn remaining_contact_budget(registry:&Registry,exclude_scene:Option<i64>)
+    ->Result<rapier3d_f64::geometry::PlanetaryContactLimits,String> {
+    let total=retained_resources(registry,exclude_scene);total.bounded()?;
+    Ok(rapier3d_f64::geometry::PlanetaryContactLimits {
+        pairs:MAX_CONTACT_PAIRS-total.pairs,manifolds:MAX_MANIFOLDS-total.manifolds,
+        points:MAX_CONTACT_POINTS-total.points,
+    })
+}
+
 pub(super) fn preview_budget(registry:&Registry, candidate:&Simulation)->Result<(),String> {
     if registry.transfer.is_some() || registry.mapped_receipt.is_some() {
         return Err("transfer ownership retains preview capacity".into());
     }
-    let mut total=Resources::default();
-    for scene in registry.scenes.values() { total.add(Resources::scene(&scene.sim)); }
-    total.add(Resources::scene(candidate));total.bounded()
+    let mut total=retained_resources(registry,None);
+    if !preview::candidate_sim(registry).is_some_and(|retained|std::ptr::eq(retained,candidate)) {
+        total.add(Resources::scene(candidate));
+    }
+    total.bounded()
 }
 
 impl Simulation {
@@ -396,6 +433,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
             if ids.len()!=3||ids[0]<=0 {return Err("joint requires stable ID and two body IDs".into());} require(values,6)?;
             if controlled::owns_body(&registry.controlled,scene,ids[1])||controlled::owns_body(&registry.controlled,scene,ids[2]){return Err("controlled actors cannot acquire undeclared constraints".into());}
             let a=vec(values,0)?;let b=vec(values,3)?;
+            admit_structural(registry,0,0,1)?;
             let region=registry.scenes.get_mut(&scene).ok_or("stale scene")?;
             if region.joints.contains_key(&ids[0]) || region.sim.impulse_joint_set.len()>=4096 {return Err("joint identity or capacity conflict".into());}
             let first=*region.bodies.get(&ids[1]).ok_or("unknown joint body")?;let second=*region.bodies.get(&ids[2]).ok_or("unknown joint body")?;

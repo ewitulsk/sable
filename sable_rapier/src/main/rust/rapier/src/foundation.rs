@@ -21,6 +21,8 @@ mod controlled;
 mod terrain_batch;
 #[path = "foundation_preview.rs"]
 mod preview;
+#[path = "foundation_preview_other.rs"]
+mod preview_other;
 
 const LIMIT: f64 = 512.0;
 const MAX_SECTIONS: usize = 4096;
@@ -163,9 +165,14 @@ impl Simulation {
         );
     }
 }
-/// The single authoritative step core, also used by a bounded staged preview registry.
-/// Nanoseconds are the native clock's admitted precision. No new IDs or other scenes are created.
 fn advance_region(registry: &mut Registry, handle: i64, elapsed_nanos: i64) -> Result<(), String> {
+    if preview::retains(registry,handle) {return Err("staged interval retains native scene step".into());}
+    if registry.preview.is_some() {return preview_other::advance(registry,handle,elapsed_nanos);}
+    advance_region_core(registry,handle,elapsed_nanos)
+}
+/// The single step core, also used by bounded detached candidate registries. Nanoseconds are
+/// the native clock's admitted precision. No new IDs or other scenes are created.
+fn advance_region_core(registry: &mut Registry, handle: i64, elapsed_nanos: i64) -> Result<(), String> {
     if elapsed_nanos <= 0 || elapsed_nanos > 50_000_000 { return Err("invalid native step duration".into()); }
     if transfer::mapping_retains(registry,handle) { return Err("mapped transfer receipt retains native scene step".into()); }
     let current=transfer::lookup(registry,handle)?;
@@ -194,6 +201,7 @@ struct Registry {
     controlled: controlled::State,
     next_preview: i64,
     preview: Option<preview::Preview>,
+    preview_terminal: HashMap<i64,preview::Terminal>,
 }
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 fn bounded(v: Vec3) -> Result<Vec3, String> {
@@ -399,6 +407,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 transfer::retire_scene(&mut registry,handle);
                 character::retire_scene(&mut registry.characters,handle);
                 controlled::retire_scene(&mut registry.controlled,handle);
+                registry.preview_terminal.remove(&handle);
                 registry
                     .scenes
                     .remove(&handle)
@@ -418,6 +427,28 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
             if !matches!(op,5|7|13|16|18|22|23|24|25|26){controlled::transfer_ready(&registry,handle,handle)?;}
             if controlled::owns_body(&registry.controlled,handle,key)&&matches!(op,3|8|9|11|12|17|22|23|24){return Err("controlled body mutation requires controlled actor owner API".into());}
             if op==8&&controlled::owns_body(&registry.controlled,handle,revision){return Err("controlled actor constraints require dedicated topology ownership".into());}
+            // Aggregate physical admission includes unrelated authoritative scenes and retained
+            // preview/transfer clones. Check before consuming geometry or removing old terrain.
+            match op {
+                3|11=>transfer::admit_structural(&registry,1,1,0)?,
+                8=>transfer::admit_structural(&registry,0,0,1)?,
+                1|14=>{
+                    let count=usize::from(binary_shape.as_ref().is_some_and(|p|p.shape.is_some()));
+                    transfer::admit_structural(&registry,count,count,0)?;
+                },
+                19=>{
+                    require(&v,4)?;
+                    if !v[3].is_finite()||v[3]<1.||v[3]>MAX_EXACT_KEY as f64||v[3].fract()!=0. {
+                        return Err("invalid prepared geometry identity".into());
+                    }
+                    let prepared=PREPARED.get_or_init(||Mutex::new(PreparedRegistry::default()))
+                        .lock().map_err(|_|"prepared geometry registry poisoned")?;
+                    let shape=prepared.shapes.get(&(v[3] as i64)).ok_or("retired prepared geometry")?;
+                    let count=usize::from(shape.shape.is_some());
+                    transfer::admit_structural(&registry,count,count,0)?;
+                },
+                _=>{},
+            }
             let region = registry
                 .scenes
                 .get_mut(&handle)
