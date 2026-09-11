@@ -84,19 +84,31 @@ fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&d
         for (local,part) in compound.shapes(){primitive_support(region,own_shape,own_pose,part.as_ref(),&(*pose * *local),parent,up,velocity,best,constraints,collect,work)?;}
         return Ok(());
     }
-    if shape.as_cuboid().is_none(){return Err("unsupported post-motion endpoint primitive".into());}
-    let Some(contact)=rapier3d_f64::parry::query::contact(own_pose,own_shape,pose,shape,0.003).map_err(|_|"unsupported endpoint contact query")? else{return Ok(());};
-    if contact.dist < -0.005{return Err("post-motion endpoint penetration exceeds physical bound".into());}
-    let normal=contact.normal2;
+    let own=own_shape.as_cuboid().ok_or("unsupported endpoint actor primitive")?;
+    let other=shape.as_cuboid().ok_or("unsupported post-motion endpoint primitive")?;
+    // Use the same cuboid manifold clipping as the solver. The single-point contact
+    // query can reject an exact face touch after selecting a far support vertex of
+    // a large floor/ceiling and measuring its diagonal distance to the small actor.
+    // This is a fresh actual-pose geometric query, never cached solver support.
+    let mut manifold=rapier3d_f64::parry::query::ContactManifold::<(),()>::new();
+    rapier3d_f64::parry::query::details::contact_manifold_cuboid_cuboid(&own_pose.inv_mul(pose),own,other,0.003,&mut manifold);
+    if manifold.points.is_empty(){return Ok(());}
+    if manifold.points.len()>8{return Err("endpoint cuboid manifold point cap".into());}
+    let normal=pose.rotation*manifold.local_n2;
     if !normal.is_finite()||(normal.length()-1.).abs()>1e-6{return Err("invalid endpoint normal".into());}
-
-    let carrier=parent.map_or(Vec3::ZERO,|handle|region.sim.rigid_body_set[handle].velocity_at_point(contact.point2));
-    if !carrier.is_finite(){return Err("invalid endpoint carrier velocity".into());}
-    if collect {if constraints.len()>=64{return Err("post-motion endpoint constraint cap".into());} constraints.push(EndpointConstraint {normal,carrier});}
-    if normal.dot(up)<0.5||(velocity-carrier).dot(normal)>0.02{return Ok(());}
-    let body=parent.and_then(|h|region.bodies.iter().find(|(_,value)|**value==h).map(|(id,_)|*id)).unwrap_or(0);
-    let support=Support {normal,carrier,point:contact.point2,body,epoch:if body==0{0}else{region.body_epochs[&body]}};
-    if best.as_ref().map_or(true,|current|normal.dot(up)>current.normal.dot(up)){*best=Some(support);}Ok(())
+    for contact in &manifold.points {
+        if !contact.dist.is_finite()||contact.dist < -0.005{return Err("post-motion endpoint penetration exceeds physical bound".into());}
+        if contact.dist>0.003{continue;}
+        let point=*pose*contact.local_p2;
+        let carrier=parent.map_or(Vec3::ZERO,|handle|region.sim.rigid_body_set[handle].velocity_at_point(point));
+        if !point.is_finite()||!carrier.is_finite(){return Err("invalid endpoint carrier point velocity".into());}
+        if collect {if constraints.len()>=64{return Err("post-motion endpoint constraint cap".into());} constraints.push(EndpointConstraint {normal,carrier});}
+        if normal.dot(up)<0.5||(velocity-carrier).dot(normal)>0.02{continue;}
+        let body=parent.and_then(|h|region.bodies.iter().find(|(_,value)|**value==h).map(|(id,_)|*id)).unwrap_or(0);
+        let support=Support {normal,carrier,point,body,epoch:if body==0{0}else{region.body_epochs[&body]}};
+        if best.as_ref().map_or(true,|current|normal.dot(up)>current.normal.dot(up)){*best=Some(support);}
+    }
+    Ok(())
 }
 fn endpoint(region:&Region,a:&Actor,up:Vec3,velocity:Vec3,collect:bool)->Result<(Option<Support>,Vec<EndpointConstraint>),String>{
     let body=actor_body(region,a)?;if body.colliders().len()!=1{return Err("endpoint actor shape count changed".into());}
