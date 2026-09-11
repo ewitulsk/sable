@@ -135,7 +135,7 @@ impl Simulation {
         // Extra island iterations alone still use one PGS sweep and can leave an asymmetric
         // angular impulse on a centered actor impact. Ordinary actor-free scenes are unchanged.
         let mut step_parameters = self.parameters;
-        if controlled_participants { step_parameters.num_internal_pgs_iterations = 4; }
+        if controlled_participants { step_parameters.num_internal_pgs_iterations = 8; }
         self.pipeline.step(
             self.gravity,
             &step_parameters,
