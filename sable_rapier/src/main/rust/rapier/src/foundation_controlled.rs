@@ -1,6 +1,8 @@
 //! Controlled actor API 1. Persistent finite-mass solver participants with explicit input/result ownership.
 //! No gameplay activation is implied: callers must publish absolute solver poses, never add a second input step.
 use super::*;
+#[path="foundation_controlled_forces.rs"]
+mod post_motion;
 use rapier3d_f64::parry::bounding_volume::BoundingVolume;
 
 pub(super) const BODY_ID_BASE: i64 = 1_i64 << 62;
@@ -26,6 +28,8 @@ struct Input {
     applied_motor_delta: Vec3,
     terminal: Option<Vec<i64>>,
     terminal_supported: bool,
+    post_rules: Option<post_motion::Rules>,
+    final_receipt: Option<Vec<i64>>,
     // Actual force events from all CCD subdivisions; never endpoint support contacts.
     events: Vec<[i64; 16]>,
 }
@@ -195,7 +199,7 @@ pub(super) fn publish_scene(state:&mut State,scene:i64,candidate:State) {
 pub(super) fn preview_complete(registry:&Registry,scene:i64)->Result<(),String> {
     let end=transfer::lookup(registry,scene)?.time_nanos;
     for actor in registry.controlled.actors.values().filter(|a|a.scene==scene) {
-        if actor.result.is_none()||!actor.input.as_ref().is_some_and(|i|i.started&&i.end==end) {
+        if actor.result.is_none()||!actor.input.as_ref().is_some_and(|i|i.started&&i.end==end&&(i.post_rules.is_none()||i.final_receipt.is_some())) {
             return Err("staged seal requires every controlled result at the exact interval end".into());
         }
     }Ok(())
@@ -586,10 +590,13 @@ pub(super) fn dispatch(
     ids: &[i64],
     values: &[f64],
 ) -> Result<Vec<i64>, String> {
-    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77 | 79) {
+    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77 | 79 | 83) {
         return Err("controlled actor mutation forbidden during transfer staging".into());
     }
     match op {
+        81 => post_motion::prepare(registry,scene,ids,values),
+        82 => post_motion::complete(registry,scene,ids,values),
+        83 => post_motion::lookup(registry,scene,ids,values),
         78 => {
             if ids.len()!=10 { return Err("terminal motor requires exact complete input receipt".into()); }
             require(values,6)?;
@@ -688,7 +695,7 @@ pub(super) fn dispatch(
             registry.controlled.actors.get_mut(&ids[0]).unwrap().input = Some(Input {
                 sequence: ids[7], start: ids[8], end: ids[9], velocity,
                 started: false, initial_velocity: velocity, segments, active_segment: 0,
-                applied_motor_delta: Vec3::ZERO, terminal: None, terminal_supported: true, events: Vec::with_capacity(MAX_CONTACTS),
+                applied_motor_delta: Vec3::ZERO, terminal: None, terminal_supported: true, post_rules: None, final_receipt: None, events: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])
         }
@@ -912,6 +919,8 @@ pub(super) fn dispatch(
                 applied_motor_delta: Vec3::ZERO,
                 terminal: None,
                 terminal_supported: true,
+                post_rules: None,
+                final_receipt: None,
                 events: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])
@@ -925,7 +934,7 @@ pub(super) fn dispatch(
             Ok(a.result.clone().unwrap_or_default())
         }
         45 => {
-            if ids.len() != 10 && ids.len() != 13 {
+            if ids.len() != 10 && ids.len() != 13 && ids.len() != 14 {
                 return Err(
                     "controlled acknowledgement needs exact owner/input/clock receipt".into(),
                 );
@@ -936,10 +945,12 @@ pub(super) fn dispatch(
             if result[11..14] != ids[7..10] {
                 return Err("controlled result acknowledgement mismatch".into());
             }
-            match &a.input.as_ref().ok_or("acknowledged input absent")?.terminal {
-                Some(receipt) if ids.len()==13 && ids[10..13]==receipt[20..23] => {},
-                None if ids.len()==10 => {},
-                _ => return Err("terminal-adjusted result requires its exact terminal-aware ACK".into()),
+            let input=a.input.as_ref().ok_or("acknowledged input absent")?;
+            match (&input.terminal,&input.post_rules,&input.final_receipt) {
+                (Some(receipt),Some(_),Some(_)) if ids.len()==14 && ids[10..13]==receipt[20..23] && ids[13]==1 => {},
+                (Some(receipt),None,None) if ids.len()==13 && ids[10..13]==receipt[20..23] => {},
+                (None,None,None) if ids.len()==10 => {},
+                _ => return Err("adjusted result requires its exact terminal/finalized-aware ACK".into()),
             }
             let a = registry.controlled.actors.get_mut(&ids[0]).unwrap();
             a.last_sequence = ids[7];
