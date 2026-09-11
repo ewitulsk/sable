@@ -48,3 +48,5 @@ gradlew         text eol=lf
 
 # These are explicitly windows files and should use crlf
 *.bat           text eol=crlf
+# Patch context must match the LF-only pinned source archive.
+*.patch text eol=lf
