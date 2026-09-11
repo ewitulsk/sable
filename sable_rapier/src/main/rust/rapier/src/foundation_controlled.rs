@@ -431,6 +431,7 @@ pub(super) fn before_step(registry: &mut Registry, scene: i64, nanos: i64) -> Re
         let body = &mut region.sim.rigid_body_set[region.bodies[&key]];
         body.set_linvel(velocity, true);
         if first { body.set_angvel(Vec3::ZERO, true); }
+        body.planetary_refresh_motor_predictions();
         let input = registry.controlled.actors.get_mut(&id).unwrap().input.as_mut().unwrap();
         if first { input.initial_velocity = velocity; }
         input.applied_motor_delta += delta;
@@ -628,7 +629,8 @@ pub(super) fn dispatch(
             receipt.extend(vector_bits(expected));receipt.extend(vector_bits(drive));receipt.extend(vector_bits(target));
             receipt.extend(vector_bits(correction));receipt.extend(vector_bits(after));receipt.push(rank as i64);
             let region=registry.scenes.get_mut(&scene).unwrap();
-            region.sim.rigid_body_set[region.bodies[&key]].set_linvel(after,true);
+            let body=&mut region.sim.rigid_body_set[region.bodies[&key]];
+            body.set_linvel(after,true);body.planetary_refresh_motor_predictions();
             region.mutation=next_mutation;
             let a=registry.controlled.actors.get_mut(&ids[0]).unwrap();
             a.result.as_mut().unwrap()[21..24].copy_from_slice(&vector_bits(after));
