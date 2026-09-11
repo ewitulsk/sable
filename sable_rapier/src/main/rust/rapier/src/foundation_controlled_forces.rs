@@ -24,11 +24,64 @@ pub(super) fn prepare(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64])
 }
 #[derive(Clone,Copy)]
 struct Support { normal:Vec3,carrier:Vec3,point:Vec3,body:i64,epoch:i64 }
+#[derive(Clone,Copy)]
+struct EndpointConstraint { normal:Vec3,carrier:Vec3 }
+// Minimize change to the requested controller impulse, never project actual velocity.
+// The feasible origin guarantees that an existing solver response can remain untouched.
+// At most three independent active planes define the Euclidean projection in 3D.
+fn endpoint_motor(actual:Vec3,requested:Vec3,events:&[[i64;16]],contacts:&[EndpointConstraint])->Result<Vec3,String>{
+    if contacts.len()>64{return Err("endpoint motor constraint cap".into());}
+    let project=|value:Vec3| { let scale=value.length().max(1.); terminal_projection(Vec3::ZERO,Vec3::ZERO,value/scale,events).map(|v|v.0*scale) };
+    let wanted=project(requested)?;
+    let basis=[project(Vec3::X)?,project(Vec3::Y)?,project(Vec3::Z)?];
+    let mut planes=Vec::with_capacity(contacts.len());
+    for contact in contacts {
+        let n=contact.normal;
+        let q=basis[0]*n.x+basis[1]*n.y+basis[2]*n.z;
+        // Outward motion may decelerate to rest, but the new motor may neither create
+        // inward relative motion nor worsen any inward solver response already present.
+        let lower=(-(actual-contact.carrier).dot(n)).min(0.);
+        if !q.is_finite()||!lower.is_finite(){return Err("invalid endpoint motor plane".into());}
+        planes.push((q,lower));
+    }
+    let feasible=|value:Vec3| value.is_finite()&&planes.iter().all(|(q,b)|q.dot(value)>=*b-1e-8);
+    if feasible(wanted){return Ok(wanted);}
+    let mut work=0;
+    let mut candidate=|active:&[usize]|->Result<Option<Vec3>,String>{
+        work+=1;if work>43744{return Err("endpoint motor active-set cap".into());}
+        let count=active.len();let mut rows=[[0.;4];3];
+        for i in 0..count {
+            let (q,b)=planes[active[i]];
+            for j in 0..count{rows[i][j]=q.dot(planes[active[j]].0);}
+            rows[i][count]=b-q.dot(wanted);
+        }
+        let scale=(0..count).map(|i|rows[i][i]).fold(0.,f64::max);
+        if scale<1e-24{return Ok(None);}
+        for col in 0..count {
+            let pivot=(col..count).max_by(|a,b|rows[*a][col].abs().total_cmp(&rows[*b][col].abs())).unwrap();
+            if rows[pivot][col].abs()<=scale*1e-12{return Ok(None);}
+            rows.swap(pivot,col);let divisor=rows[col][col];
+            for j in col..=count{rows[col][j]/=divisor;}
+            let pivot_row=rows[col];for i in 0..count{if i!=col{let factor=rows[i][col];for j in col..=count{rows[i][j]-=factor*pivot_row[j];}}}
+        }
+        let mut result=wanted;
+        for i in 0..count{let lambda=rows[i][count];if !lambda.is_finite()||lambda<0.{return Ok(None);}result+=planes[active[i]].0*lambda;}
+        if !feasible(result)||active.iter().any(|i|(planes[*i].0.dot(result)-planes[*i].1).abs()>1e-8){return Ok(None);}
+        // The positive multipliers, active equalities and all other halfspaces are the
+        // complete KKT certificate. Reject any loss of the actual impulse nullspace.
+        if project(result)?.distance(result)>1e-8{return Err("endpoint motor lost contact nullspace".into());}
+        Ok(Some(result))
+    };
+    for i in 0..planes.len(){if let Some(value)=candidate(&[i])?{return Ok(value);}}
+    for i in 0..planes.len(){for j in i+1..planes.len(){if let Some(value)=candidate(&[i,j])?{return Ok(value);}}}
+    for i in 0..planes.len(){for j in i+1..planes.len(){for k in j+1..planes.len(){if let Some(value)=candidate(&[i,j,k])?{return Ok(value);}}}}
+    Err("endpoint motor projection has no numerically verified solution".into())
+}
 fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&dyn Shape,pose:&Pose,
-                     parent:Option<RigidBodyHandle>,up:Vec3,velocity:Vec3,best:&mut Option<Support>,work:&mut usize)->Result<(),String>{
+                     parent:Option<RigidBodyHandle>,up:Vec3,velocity:Vec3,best:&mut Option<Support>,constraints:&mut Vec<EndpointConstraint>,collect:bool,work:&mut usize)->Result<(),String>{
     *work+=1;if *work>16384{return Err("post-motion endpoint primitive cap".into());}
     if let Some(compound)=shape.as_compound(){
-        for (local,part) in compound.shapes(){primitive_support(region,own_shape,own_pose,part.as_ref(),&(*pose * *local),parent,up,velocity,best,work)?;}
+        for (local,part) in compound.shapes(){primitive_support(region,own_shape,own_pose,part.as_ref(),&(*pose * *local),parent,up,velocity,best,constraints,collect,work)?;}
         return Ok(());
     }
     if shape.as_cuboid().is_none(){return Err("unsupported post-motion endpoint primitive".into());}
@@ -36,26 +89,28 @@ fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&d
     if contact.dist < -0.005{return Err("post-motion endpoint penetration exceeds physical bound".into());}
     let normal=contact.normal2;
     if !normal.is_finite()||(normal.length()-1.).abs()>1e-6{return Err("invalid endpoint normal".into());}
-    if normal.dot(up)<0.5{return Ok(());}
+
     let carrier=parent.map_or(Vec3::ZERO,|handle|region.sim.rigid_body_set[handle].velocity_at_point(contact.point2));
-    if !carrier.is_finite()||(velocity-carrier).dot(normal)>0.02{return Ok(());}
+    if !carrier.is_finite(){return Err("invalid endpoint carrier velocity".into());}
+    if collect {if constraints.len()>=64{return Err("post-motion endpoint constraint cap".into());} constraints.push(EndpointConstraint {normal,carrier});}
+    if normal.dot(up)<0.5||(velocity-carrier).dot(normal)>0.02{return Ok(());}
     let body=parent.and_then(|h|region.bodies.iter().find(|(_,value)|**value==h).map(|(id,_)|*id)).unwrap_or(0);
     let support=Support {normal,carrier,point:contact.point2,body,epoch:if body==0{0}else{region.body_epochs[&body]}};
     if best.as_ref().map_or(true,|current|normal.dot(up)>current.normal.dot(up)){*best=Some(support);}Ok(())
 }
-fn endpoint(region:&Region,a:&Actor,up:Vec3,velocity:Vec3)->Result<Option<Support>,String>{
+fn endpoint(region:&Region,a:&Actor,up:Vec3,velocity:Vec3,collect:bool)->Result<(Option<Support>,Vec<EndpointConstraint>),String>{
     let body=actor_body(region,a)?;if body.colliders().len()!=1{return Err("endpoint actor shape count changed".into());}
     if region.sim.collider_set.len()>8192{return Err("post-motion endpoint collider cap".into());}
     let own=body.colliders()[0];let collider=&region.sim.collider_set[own];
     let pose=*body.position()*collider.position_wrt_parent().ok_or("endpoint actor parent missing")?;
-    let bounds=collider.shape().compute_aabb(&pose).loosened(0.003);let mut candidates=0;let mut work=0;let mut best=None;
+    let bounds=collider.shape().compute_aabb(&pose).loosened(0.003);let mut candidates=0;let mut work=0;let mut best=None;let mut constraints=Vec::new();
     for (handle,other) in region.sim.collider_set.iter(){
         if handle==own||!other.is_enabled()||other.is_sensor()||!collider.collision_groups().test(other.collision_groups())||!collider.solver_groups().test(other.solver_groups()){continue;}
         let actual=other.parent().map_or(*other.position(),|h|*region.sim.rigid_body_set[h].position()*other.position_wrt_parent().unwrap());
         if !bounds.intersects(&other.shape().compute_aabb(&actual)){continue;}
         candidates+=1;if candidates>64{return Err("post-motion endpoint candidate cap".into());}
-        primitive_support(region,collider.shape(),&pose,other.shape(),&actual,other.parent(),up,velocity,&mut best,&mut work)?;
-    }Ok(best)
+        primitive_support(region,collider.shape(),&pose,other.shape(),&actual,other.parent(),up,velocity,&mut best,&mut constraints,collect,&mut work)?;
+    }Ok((best,constraints))
 }
 pub(super) fn complete(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64])->Result<Vec<i64>,String>{
     if ids.len()!=10{return Err("post-motion finalization requires exact input".into());}require(values,0)?;
@@ -67,7 +122,7 @@ pub(super) fn complete(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64]
     let terminal=input.terminal.as_ref().ok_or("terminal motor must precede post-motion forces")?;
     let before=actor_body(region,a)?.linvel();
     if vector(terminal,26)!=before||vector(result,21)!=before{return Err("post-motion actual terminal velocity CAS mismatch".into());}
-    let support=endpoint(region,a,rules.up,before)?;
+    let (support,constraints)=endpoint(region,a,rules.up,before,rules.flight!=0)?;
     let normal=support.map_or(Vec3::ZERO,|s|s.normal);let carrier=support.map_or(Vec3::ZERO,|s|s.carrier);
     let gravity=if rules.flight==0{
         let inward=rules.acceleration.dot(normal);
@@ -78,8 +133,9 @@ pub(super) fn complete(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64]
     let dragged=(relative-axis*vertical)*(if support.is_some(){0.546}else{0.91})+axis*(vertical*0.98)+carrier;
     let flight=if rules.flight==0{Vec3::ZERO}else{
         let axis=if rules.flight==1{Vec3::Y}else{rules.up};
-        terminal_projection(dragged,axis*dragged.dot(axis),axis*(rules.component*0.6),&input.events)?.0
+        endpoint_motor(dragged,axis*(rules.component*0.6-dragged.dot(axis)),&input.events,&constraints)?
     };
+    if input.events.iter().any(|event|flight.dot(vector(event,12)).abs()>1e-8){return Err("endpoint flight changed retained contact-normal response".into());}
     let after=dragged+flight;if !after.is_finite()||after.length()>MAX_SPEED{return Err("post-motion final velocity exceeds bound".into());}
     let next_mutation=region.mutation.checked_add(1).ok_or("post-motion mutation exhausted")?;
     let mut receipt=result[..14].to_vec();receipt.push(rules.flight);receipt.extend(vector_bits(rules.acceleration));receipt.extend(vector_bits(rules.up));receipt.push(bits(rules.component));
