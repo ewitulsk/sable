@@ -8,6 +8,8 @@ const MAX_PLAYERS: usize = 8;
 const MAX_ITEMS: usize = 64;
 const MAX_CONTACTS: usize = 64;
 const MAX_SPEED: f64 = 320.;
+// Local accuracy cost for islands touching an actor; existing error tolerances are unchanged.
+const ADDITIONAL_SOLVER_ITERATIONS: usize = 8;
 #[derive(Clone)]
 struct Input {
     sequence: i64,
@@ -215,6 +217,7 @@ pub(super) fn before_step(registry: &mut Registry, scene: i64, nanos: i64) -> Re
         let body = actor_body(region, a)?;
         if !body.is_dynamic()
             || (body.mass() - a.mass).abs() > a.mass * 1e-9
+            || body.additional_solver_iterations() != ADDITIONAL_SOLVER_ITERATIONS
             || body.gravity_scale() != 0.
             || body.linear_damping() != 0.
             || body.angular_damping() != 0.
@@ -448,6 +451,7 @@ pub(super) fn dispatch(
                 RigidBodyBuilder::dynamic()
                     .pose(pose)
                     .linvel(velocity)
+                    .additional_solver_iterations(ADDITIONAL_SOLVER_ITERATIONS)
                     .gravity_scale(0.)
                     .linear_damping(0.)
                     .angular_damping(0.)
