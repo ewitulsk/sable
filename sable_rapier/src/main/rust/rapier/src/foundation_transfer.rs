@@ -39,6 +39,15 @@ impl Resources {
         self.pairs as i64,self.manifolds as i64,self.points as i64] }
 }
 
+pub(super) fn preview_budget(registry:&Registry, candidate:&Simulation)->Result<(),String> {
+    if registry.transfer.is_some() || registry.mapped_receipt.is_some() {
+        return Err("transfer ownership retains preview capacity".into());
+    }
+    let mut total=Resources::default();
+    for scene in registry.scenes.values() { total.add(Resources::scene(&scene.sim)); }
+    total.add(Resources::scene(candidate));total.bounded()
+}
+
 impl Simulation {
     /// Settle exact retired collider generations in a staged owner before reusing arena slots.
     /// This is maintenance of deferred removals, not a simulation step or a contact reset.
@@ -58,7 +67,7 @@ impl Simulation {
         self.broad_phase.planetary_initialize_static(&self.parameters,&self.rigid_body_set,&self.collider_set);
         self.rigid_body_set.planetary_clear_static_changes();self.collider_set.planetary_clear_static_changes();
     }
-    fn staged_clone(&self)->Self {
+    pub(super) fn staged_clone(&self)->Self {
         Self { pipeline:PhysicsPipeline::new(),rigid_body_set:self.rigid_body_set.clone(),
             collider_set:self.collider_set.clone(),island_manager:self.island_manager.clone(),
             broad_phase:self.broad_phase.clone(),narrow_phase:self.narrow_phase.clone(),
@@ -306,8 +315,11 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64,mapped:b
         moved_bodies:count,moved_joints:moved_joints.len(),moved_contacts,mapping:None})
 }
 
-fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->Result<Vec<i64>,String> {
-    if mapping_retains(registry,scene)&&!matches!(op,0|3|7|8|11|13|20|22|30|35|40|42|44|49|50|52|53|54|56){return Err("mapped transfer receipt retains scene mutations".into());}
+pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->Result<Vec<i64>,String> {
+    if (60..=69).contains(&op) { return preview::dispatch(registry,scene,op,ids,values); }
+    if registry.preview.is_some()&&matches!(op,4|51){return Err("staged interval retains bounded transfer staging capacity".into());}
+    if preview::retains(registry,scene)&&!matches!(op,0|3|7|8|11|13|20|22|30|35|40|42|44|49|50|56|57|58){return Err("staged interval retains native scene mutations".into());}
+    if mapping_retains(registry,scene)&&!matches!(op,0|3|7|8|11|13|20|22|30|35|40|42|44|49|50|52|53|54|56|57|58){return Err("mapped transfer receipt retains scene mutations".into());}
     if matches!(op,1|2|14){controlled::transfer_ready(registry,scene,scene)?;}
     match op {
         50 => {if !ids.is_empty(){return Err("mapped transfer capability takes no identities".into());}require(values,0)?;Ok(vec![4,1,4096,128])},
@@ -519,7 +531,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
         },
         20..=27 => character::dispatch(registry,scene,op,ids,values),
         30..=35 => {controlled::transfer_ready(registry,scene,scene)?;terrain_batch::dispatch(registry,scene,op,ids,values)},
-        40..=49 => controlled::dispatch(registry,scene,op,ids,values),
+        40..=49 | 57 | 58 => controlled::dispatch(registry,scene,op,ids,values),
         _=>Err("unknown typed foundation operation".into()),
     }
 }

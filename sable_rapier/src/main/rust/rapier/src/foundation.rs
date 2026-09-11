@@ -19,6 +19,8 @@ mod time;
 mod controlled;
 #[path = "foundation_terrain_batch.rs"]
 mod terrain_batch;
+#[path = "foundation_preview.rs"]
+mod preview;
 
 const LIMIT: f64 = 512.0;
 const MAX_SECTIONS: usize = 4096;
@@ -132,7 +134,7 @@ impl Simulation {
             },
         }
     }
-    fn step(&mut self, dt: f64, controlled_participants: bool) {
+    fn step(&mut self, dt: f64, controlled_participants: bool, events: &dyn EventHandler) {
         self.parameters.dt = dt;
         // Resolve the complete contact patch before each small-step rotation integration.
         // Extra island iterations alone still use one PGS sweep and can leave an asymmetric
@@ -157,9 +159,29 @@ impl Simulation {
             &mut self.multibody_joint_set,
             &mut self.ccd_solver,
             &(),
-            &(),
+            events,
         );
     }
+}
+/// The single authoritative step core, also used by a bounded staged preview registry.
+/// Nanoseconds are the native clock's admitted precision. No new IDs or other scenes are created.
+fn advance_region(registry: &mut Registry, handle: i64, elapsed_nanos: i64) -> Result<(), String> {
+    if elapsed_nanos <= 0 || elapsed_nanos > 50_000_000 { return Err("invalid native step duration".into()); }
+    if transfer::mapping_retains(registry,handle) { return Err("mapped transfer receipt retains native scene step".into()); }
+    let current=transfer::lookup(registry,handle)?;
+    let next_time=current.time_nanos.checked_add(elapsed_nanos).ok_or("simulation clock exhausted")?;
+    let next_mutation=current.mutation.checked_add(1).ok_or("scene mutation exhausted")?;
+    let next_history=time::prepare_advance(current,handle,next_time)?;
+    let events=controlled::StepEvents::prepare(registry,handle,next_time)?;
+    controlled::before_step(registry,handle,elapsed_nanos)?;
+    let controlled_participants=controlled::owns_scene(&registry.controlled,handle);
+    let region=registry.scenes.get_mut(&handle).unwrap();
+    region.sim.step(elapsed_nanos as f64 / 1_000_000_000.,controlled_participants,if controlled_participants { &events } else { &() });region.time_nanos=next_time;region.mutation=next_mutation;
+    region.body_history=next_history;
+    if let Err(error)=region.sim.validate_bounds(Vec3::ZERO){region.failed_range=true;return Err(error);}
+    if let Err(error)=events.finish(registry,handle){registry.scenes.get_mut(&handle).unwrap().failed_range=true;return Err(error);}
+    if let Err(error)=controlled::after_step(registry,handle){registry.scenes.get_mut(&handle).unwrap().failed_range=true;return Err(error);}
+    Ok(())
 }
 #[derive(Default)]
 struct Registry {
@@ -170,6 +192,8 @@ struct Registry {
     mapped_receipt: Option<transfer::RetainedMapping>,
     characters: character::State,
     controlled: controlled::State,
+    next_preview: i64,
+    preview: Option<preview::Preview>,
 }
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 fn bounded(v: Vec3) -> Result<Vec3, String> {
@@ -369,6 +393,7 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 return Ok(vec![id as f64, 1.0]);
             }
             if op == 10 {
+                if preview::retains(&registry,handle){return Err("staged interval retains scene lifetime".into());}
                 if transfer::mapping_retains(&registry,handle){return Err("mapped receipt retains scene lifetime".into());}
                 if controlled::owns_scene(&registry.controlled,handle){return Err("controlled participants retain scene until explicit retirement".into());}
                 transfer::retire_scene(&mut registry,handle);
@@ -381,22 +406,13 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 return Ok(vec![]);
             }
             if transfer::mapping_retains(&registry,handle)&&!matches!(op,5|7|13|16|18|25|26){return Err("mapped transfer receipt retains native scene mutations".into());}
+            if preview::retains(&registry,handle)&&!matches!(op,5|7|13|16|18|25|26){return Err("staged interval retains native scene mutations".into());}
             if op == 4 {
                 require(&v,1)?;
                 if !v[0].is_finite()||v[0]<=0.||v[0]>0.05{return Err("invalid step".into());}
                 let elapsed_nanos=(v[0]*1_000_000_000.).round() as i64;
                 if elapsed_nanos<=0{return Err("step below native clock precision".into());}
-                let current=transfer::lookup(&registry,handle)?;
-                let next_time=current.time_nanos.checked_add(elapsed_nanos).ok_or("simulation clock exhausted")?;
-                let next_mutation=current.mutation.checked_add(1).ok_or("scene mutation exhausted")?;
-                let next_history=time::prepare_advance(current,handle,next_time)?;
-                controlled::before_step(&mut registry,handle,elapsed_nanos)?;
-                let controlled_participants=controlled::owns_scene(&registry.controlled,handle);
-                let region=registry.scenes.get_mut(&handle).unwrap();
-                region.sim.step(v[0],controlled_participants);region.time_nanos=next_time;region.mutation=next_mutation;
-                region.body_history=next_history;
-                if let Err(error)=region.sim.validate_bounds(Vec3::ZERO){region.failed_range=true;return Err(error);}
-                if let Err(error)=controlled::after_step(&mut registry,handle){registry.scenes.get_mut(&handle).unwrap().failed_range=true;return Err(error);}
+                advance_region(&mut registry,handle,elapsed_nanos)?;
                 return Ok(vec![]);
             }
             if !matches!(op,5|7|13|16|18|22|23|24|25|26){controlled::transfer_ready(&registry,handle,handle)?;}

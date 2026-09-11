@@ -5,9 +5,11 @@ const MAX_BATCH:usize=8;
 const MAX_BODY_CANDIDATES:usize=64;
 const MAX_CONTACT_PARTS:usize=16384;
 const PENETRATION_EPSILON:f64=0.00001;
+#[derive(Clone)]
 struct Receipt { request:Vec<i64>,values:Vec<u64>,result:Vec<i64> }
-#[derive(Default)]
+#[derive(Clone,Default)]
 pub(super) struct State { high_water:i64,receipt:Option<Receipt> }
+pub(super) fn idle(state:&State)->bool { state.receipt.is_none() }
 
 fn primitive_key(pose:&Pose,shape:&SharedShape)->Result<[u64;10],String>{
     let half=shape.as_cuboid().ok_or("terrain edit requires compiled box primitives")?.half_extents;

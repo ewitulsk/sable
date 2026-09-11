@@ -18,6 +18,8 @@ struct Input {
     velocity: Vec3,
     started: bool,
     initial_velocity: Vec3,
+    // Actual force events from all CCD subdivisions; never endpoint support contacts.
+    events: Vec<[i64; 16]>,
 }
 #[derive(Clone)]
 struct Actor {
@@ -31,10 +33,115 @@ struct Actor {
     input: Option<Input>,
     result: Option<Vec<i64>>,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct State {
     next_lease: i64,
     actors: HashMap<i64, Actor>,
+}
+/// One bounded collector per actual outer native step, constructed before any physics mutation.
+/// Rapier invokes the force handler inside CCD subdivisions. Its API exposes dt, not the
+/// subdivision's absolute start, so each event reports the honest enclosing native-step bracket.
+#[derive(Clone, Copy, Default)]
+struct Peer { body: i64, epoch: i64, actor: i64, kind: i64, registration: i64 }
+struct EventBuffer {
+    counts: HashMap<i64, usize>,
+    rows: Vec<(i64, [i64; 16])>,
+    failed: bool,
+}
+pub(super) struct StepEvents {
+    start: i64,
+    end: i64,
+    peers: HashMap<RigidBodyHandle, Peer>,
+    buffer: Mutex<EventBuffer>,
+}
+impl StepEvents {
+    pub(super) fn prepare(registry: &Registry, scene: i64, end: i64) -> Result<Self, String> {
+        let region = transfer::lookup(registry, scene)?;
+        if !owns_scene(&registry.controlled, scene) {
+            return Ok(Self { start: region.time_nanos, end, peers: HashMap::new(),
+                buffer: Mutex::new(EventBuffer { counts: HashMap::new(), rows: Vec::new(), failed: false }) });
+        }
+        if region.bodies.len() > 4096 || region.sections.len() > MAX_SECTIONS {
+            return Err("interval history body/terrain registry cap".into());
+        }
+        let mut peers = HashMap::with_capacity(region.bodies.len()+region.sections.len());
+        for section in region.sections.values() {
+            if let Some(handle)=section.body { peers.insert(handle,Peer::default()); }
+        }
+        for (id, handle) in &region.bodies {
+            peers.insert(*handle, Peer { body: *id, epoch: region.body_epochs[id], ..Peer::default() });
+        }
+        let mut counts = HashMap::new();
+        let mut capacity = 0;
+        for actor in registry.controlled.actors.values().filter(|a|a.scene == scene) {
+            let input = actor.input.as_ref().ok_or("interval history requires complete queued input")?;
+            if input.events.len() > MAX_CONTACTS || counts.len() >= MAX_PLAYERS + MAX_ITEMS {
+                return Err("interval history participant/event cap".into());
+            }
+            let peer = peers.get_mut(&region.bodies[&actor.body]).ok_or("interval actor missing body")?;
+            peer.actor = actor.id; peer.kind = actor.kind; peer.registration = actor.lease;
+            counts.insert(actor.id, input.events.len());
+            capacity += MAX_CONTACTS - input.events.len();
+        }
+        Ok(Self { start: region.time_nanos, end, peers,
+            buffer: Mutex::new(EventBuffer { counts, rows: Vec::with_capacity(capacity), failed: false }) })
+    }
+    pub(super) fn finish(self, registry: &mut Registry, scene: i64) -> Result<(), String> {
+        let mut buffer = self.buffer.into_inner().map_err(|_|"interval contact collector poisoned")?;
+        // Callback scheduling is not an ordering guarantee. Preserve actual step brackets,
+        // then deterministically order events within that bracket without inventing CCD times.
+        buffer.rows.sort_unstable();
+        for (id, event) in buffer.rows {
+            let actor = registry.controlled.actors.get_mut(&id).ok_or("interval event actor vanished")?;
+            if actor.scene != scene { return Err("interval event actor changed scene".into()); }
+            actor.input.as_mut().ok_or("interval event input vanished")?.events.push(event);
+        }
+        if buffer.failed { return Err("interval contact history overflow or invalid native event; scene retained".into()); }
+        Ok(())
+    }
+}
+impl EventHandler for StepEvents {
+    fn handle_collision_event(&self, _: &RigidBodySet, _: &ColliderSet, _: CollisionEvent, _: Option<&ContactPair>) {}
+    fn handle_contact_force_event(&self, dt: f64, _: &RigidBodySet, colliders: &ColliderSet,
+                                  pair: &ContactPair, total_force: f64) {
+        let Ok(mut buffer) = self.buffer.lock() else { return; };
+        if buffer.failed { return; }
+        let Some(first) = colliders.get(pair.collider1) else { buffer.failed=true; return; };
+        let Some(second) = colliders.get(pair.collider2) else { buffer.failed=true; return; };
+        let Some(a) = first.parent().and_then(|h|self.peers.get(&h)).copied() else { buffer.failed=true; return; };
+        let Some(b) = second.parent().and_then(|h|self.peers.get(&h)).copied() else { buffer.failed=true; return; };
+        if !dt.is_finite() || dt <= 0. || !total_force.is_finite() || total_force <= 0. {
+            buffer.failed=true; return;
+        }
+        for manifold in &pair.manifolds {
+            // Inactive manifolds may retain cached impulses. They were not solver contacts
+            // for this callback and must not become historical physical-contact evidence.
+            if manifold.data.solver_contacts.is_empty() { continue; }
+            // This is the actual normal impulse sum recorded by Rapier for this manifold.
+            // It is not a vector net impulse or a force inferred from endpoint displacement.
+            let impulse: f64 = manifold.points.iter().map(|p|p.data.impulse).sum();
+            if impulse == 0. { continue; }
+            if !impulse.is_finite() || impulse < 0. {
+                buffer.failed=true; return;
+            }
+            let point = manifold.data.solver_contacts.iter().map(|p|p.point).sum::<Vec3>()
+                / manifold.data.solver_contacts.len() as f64;
+            let normal = manifold.data.normal;
+            if !point.is_finite() || !normal.is_finite() || (normal.length()-1.).abs()>1e-6 {
+                buffer.failed=true; return;
+            }
+            for (recipient, other, collider, outward) in [(a,b,pair.collider2,-normal),(b,a,pair.collider1,normal)] {
+                if recipient.actor == 0 { continue; }
+                let Some(count) = buffer.counts.get_mut(&recipient.actor) else { buffer.failed=true; return; };
+                if *count >= MAX_CONTACTS { buffer.failed=true; return; }
+                *count += 1;
+                let (slot,generation)=collider.into_raw_parts();
+                buffer.rows.push((recipient.actor, [self.start,self.end,other.body,other.epoch,
+                    slot as i64,generation as i64,other.actor,other.kind,other.registration,
+                    bits(point.x),bits(point.y),bits(point.z),bits(outward.x),bits(outward.y),bits(outward.z),bits(impulse)]));
+            }
+        }
+    }
 }
 fn bits(v: f64) -> i64 {
     v.to_bits() as i64
@@ -57,6 +164,23 @@ pub(super) fn owns_body(state: &State, scene: i64, id: i64) -> bool {
 }
 pub(super) fn owns_scene(state: &State, scene: i64) -> bool {
     state.actors.values().any(|a| a.scene == scene)
+}
+pub(super) fn snapshot_scene(state:&State,scene:i64)->State {
+    State { next_lease:state.next_lease,actors:state.actors.iter().filter(|(_,a)|a.scene==scene)
+        .map(|(id,a)|(*id,a.clone())).collect() }
+}
+pub(super) fn publish_scene(state:&mut State,scene:i64,candidate:State) {
+    state.actors.retain(|_,a|a.scene!=scene);
+    state.next_lease=state.next_lease.max(candidate.next_lease);
+    state.actors.extend(candidate.actors);
+}
+pub(super) fn preview_complete(registry:&Registry,scene:i64)->Result<(),String> {
+    let end=transfer::lookup(registry,scene)?.time_nanos;
+    for actor in registry.controlled.actors.values().filter(|a|a.scene==scene) {
+        if actor.result.is_none()||!actor.input.as_ref().is_some_and(|i|i.started&&i.end==end) {
+            return Err("staged seal requires every controlled result at the exact interval end".into());
+        }
+    }Ok(())
 }
 pub(super) fn mapped_actor_words(
     state: &State,
@@ -384,10 +508,26 @@ pub(super) fn dispatch(
     ids: &[i64],
     values: &[f64],
 ) -> Result<Vec<i64>, String> {
-    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44) {
+    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58) {
         return Err("controlled actor mutation forbidden during transfer staging".into());
     }
     match op {
+        57 => {
+            if !ids.is_empty() { return Err("interval contact capability takes no identities".into()); }
+            require(values,0)?;
+            Ok(vec![1,MAX_CONTACTS as i64,(MAX_PLAYERS+MAX_ITEMS) as i64,16])
+        }
+        58 => {
+            if ids.len()!=10 { return Err("interval contact history requires exact result receipt".into()); }
+            require(values,0)?;
+            let a=actor(registry,scene,ids)?;
+            let result=a.result.as_ref().ok_or("completed interval history absent or acknowledged")?;
+            if result[11..14]!=ids[7..10] { return Err("interval history result mismatch".into()); }
+            let input=a.input.as_ref().ok_or("interval history input absent")?;
+            let mut out=result[..14].to_vec();out.push(input.events.len() as i64);
+            for event in &input.events { out.extend(event); }
+            Ok(out)
+        }
         40 => {
             if !ids.is_empty() {
                 return Err("controlled actor capability takes no identities".into());
@@ -478,6 +618,8 @@ pub(super) fn dispatch(
             region.sim.collider_set.insert_with_parent(
                 ColliderBuilder::cuboid(half.x, half.y, half.z)
                     .mass(mass)
+                    .active_events(ActiveEvents::CONTACT_FORCE_EVENTS)
+                    .contact_force_event_threshold(0.)
                     .friction(0.)
                     .friction_combine_rule(CoefficientCombineRule::Min)
                     .restitution(0.)
@@ -559,6 +701,7 @@ pub(super) fn dispatch(
                 velocity,
                 started: false,
                 initial_velocity: velocity,
+                events: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])
         }

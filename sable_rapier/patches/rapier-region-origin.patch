@@ -1,4 +1,363 @@
+diff --git a/src/data/modified_objects.rs b/src/data/modified_objects.rs
+index b662bc9..5d85473 100644
+--- a/src/data/modified_objects.rs
++++ b/src/data/modified_objects.rs
+@@ -34,6 +34,8 @@ impl<Handle, Object> Deref for ModifiedObjects<Handle, Object> {
+ }
+ 
+ impl<Handle, Object: HasModifiedFlag> ModifiedObjects<Handle, Object> {
++    /// Reserve bounded mutation metadata before a planetary publication transaction.
++    pub fn planetary_reserve(&mut self, additional: usize) { self.0.reserve(additional); }
+     /// Preallocate memory for `capacity` handles
+     pub fn with_capacity(capacity: usize) -> Self {
+         Self(Vec::with_capacity(capacity), PhantomData)
+diff --git a/src/dynamics/ccd/ccd_solver.rs b/src/dynamics/ccd/ccd_solver.rs
+index 0df3c05..bde79f5 100644
+--- a/src/dynamics/ccd/ccd_solver.rs
++++ b/src/dynamics/ccd/ccd_solver.rs
+@@ -109,6 +109,7 @@ impl CCDSolver {
+                     .ccd_vels
+                     .integrate(toi.max(min_toi), &rb.pos.position, local_com);
+                 rb.pos.next_position = new_pos;
++                rb.planetary_record_pose(&new_pos, 3);
+             }
+         }
+     }
+@@ -165,6 +166,7 @@ impl CCDSolver {
+                     let predicted_pos = rb
+                         .pos
+                         .integrate_forces_and_velocities(dt, &rb.forces, &rb.vels, &rb.mprops);
++                    rb.planetary_record_pose(&predicted_pos, 2);
+                     let next_position = predicted_pos * co_parent.pos_wrt_parent;
+                     let swept_aabb = co.shape.compute_swept_aabb(&co.pos, &next_position);
+                     broad_phase.set_aabb(params, handle, swept_aabb);
+@@ -172,6 +174,7 @@ impl CCDSolver {
+             }
+         }
+ 
++        broad_phase.planetary_record_cached_aabbs(bodies, colliders);
+         let query_pipeline = broad_phase.as_query_pipeline(
+             narrow_phase.query_dispatcher(),
+             bodies,
+@@ -192,6 +195,7 @@ impl CCDSolver {
+                     &rb1.ccd_vels,
+                     &rb1.mprops,
+                 );
++                rb1.planetary_record_pose(&predicted_body_pos1, 2);
+ 
+                 for ch1 in &rb1.colliders.0 {
+                     let co1 = &colliders[*ch1];
+@@ -302,6 +306,7 @@ impl CCDSolver {
+                 let rb = &bodies[co_parent.handle];
+                 if rb.is_ccd_active() {
+                     let rb_next_pos = &bodies[co_parent.handle].pos.next_position;
++                    bodies[co_parent.handle].planetary_record_pose(rb_next_pos, 2);
+                     let next_position = rb_next_pos * co_parent.pos_wrt_parent;
+                     let swept_aabb = co.shape.compute_swept_aabb(&co.pos, &next_position);
+                     broad_phase.set_aabb(params, handle, swept_aabb);
+@@ -309,6 +314,7 @@ impl CCDSolver {
+             }
+         }
+ 
++        broad_phase.planetary_record_cached_aabbs(bodies, colliders);
+         let query_pipeline = broad_phase.as_query_pipeline(
+             narrow_phase.query_dispatcher(),
+             bodies,
+@@ -332,6 +338,7 @@ impl CCDSolver {
+                     &rb1.ccd_vels,
+                     &rb1.mprops,
+                 );
++                rb1.planetary_record_pose(&predicted_body_pos1, 2);
+ 
+                 for ch1 in &rb1.colliders.0 {
+                     let co1 = &colliders[*ch1];
+@@ -569,6 +576,7 @@ impl CCDSolver {
+                 let pos1 = frozen1
+                     .map(|t| rb1.ccd_vels.integrate(*t, &rb1.pos.position, local_com1))
+                     .unwrap_or(rb1.pos.next_position);
++                rb1.planetary_record_pose(&pos1, 2);
+                 pos1 * co_parent1.pos_wrt_parent
+             } else {
+                 co1.pos.0
+@@ -582,6 +590,7 @@ impl CCDSolver {
+                 let pos2 = frozen2
+                     .map(|t| rb2.ccd_vels.integrate(*t, &rb2.pos.position, local_com2))
+                     .unwrap_or(rb2.pos.next_position);
++                rb2.planetary_record_pose(&pos2, 2);
+                 pos2 * co_parent2.pos_wrt_parent
+             } else {
+                 co2.pos.0
+diff --git a/src/dynamics/ccd/toi_entry.rs b/src/dynamics/ccd/toi_entry.rs
+index 11937d8..d7b3bb2 100644
+--- a/src/dynamics/ccd/toi_entry.rs
++++ b/src/dynamics/ccd/toi_entry.rs
+@@ -91,13 +91,37 @@ impl TOIEntry {
+         let mut motion2 = rb2.map(Self::body_motion).unwrap_or(identity);
+ 
+         if let Some(t) = frozen1 {
++            if let Some(body) = rb1 {
++                if body.planetary_sweep.is_some() {
++                    body.planetary_record_pose(&motion1.position_at_time(t), 2);
++                }
++            }
+             motion1.freeze(t);
+         }
+ 
+         if let Some(t) = frozen2 {
++            if let Some(body) = rb2 {
++                if body.planetary_sweep.is_some() {
++                    body.planetary_record_pose(&motion2.position_at_time(t), 2);
++                }
++            }
+             motion2.freeze(t);
+         }
+ 
++        // Observe the actual velocity-only nonlinear cast, not the force-integrated CCD
++        // broad-phase prediction. Opposing forces can make those two paths very different.
++        // The collector's whole-collider radius about COM encloses arbitrary rotation;
++        // this motion has affine COM translation (or is constant after freeze), so the
++        // interval endpoints enclose every intermediate occupied/query pose.
++        for (body, motion) in [(rb1, &motion1), (rb2, &motion2)] {
++            if let Some(body) = body {
++                if body.planetary_sweep.is_some() {
++                    body.planetary_record_pose(&motion.position_at_time(start_time), 2);
++                    body.planetary_record_pose(&motion.position_at_time(end_time), 2);
++                }
++            }
++        }
++
+         let motion_c1 = motion1.prepend(co1.parent.map(|p| p.pos_wrt_parent).unwrap_or(co1.pos.0));
+         let motion_c2 = motion2.prepend(co2.parent.map(|p| p.pos_wrt_parent).unwrap_or(co2.pos.0));
+ 
+diff --git a/src/dynamics/island_manager/manager.rs b/src/dynamics/island_manager/manager.rs
+index 3cbc927..8291ce5 100644
+--- a/src/dynamics/island_manager/manager.rs
++++ b/src/dynamics/island_manager/manager.rs
+@@ -47,6 +47,33 @@ pub struct IslandManager {
+ }
+ 
+ impl IslandManager {
++    /// Import source island membership in source order, retaining sleep components and candidates.
++    /// The caller has already proved that active contacts/joints cannot cross the selected group.
++    pub fn planetary_import_islands(&mut self, source: &Self, bodies: &mut RigidBodySet, remap: &[(RigidBodyHandle, RigidBodyHandle)]) {
++        let mapped = |old: RigidBodyHandle| remap.iter().find(|(a, _)| *a == old).map(|(_, b)| *b);
++        for (_, original) in source.islands.iter() {
++            let handles: Vec<_> = original.bodies.iter().filter_map(|h| mapped(*h)).collect();
++            if handles.is_empty() { continue; }
++            let mut imported = original.clone();
++            imported.bodies = handles;
++            let id = self.free_islands.pop().unwrap_or(self.islands.len());
++            imported.id_in_awake_list = if original.is_sleeping() { None } else {
++                let awake = self.awake_islands.len(); self.awake_islands.push(id); Some(awake)
++            };
++            for (index, handle) in imported.bodies.iter().enumerate() {
++                let rb = bodies.index_mut_internal(*handle);
++                rb.ids.active_island_id = id;
++                rb.ids.active_set_id = index;
++                // Timestamp is a destination traversal marker, not transferable physical state.
++                rb.ids.active_set_timestamp = self.traversal_timestamp.wrapping_sub(1);
++            }
++            self.islands.insert(id, imported);
++        }
++        for candidate in &source.traversal_candidates {
++            if let Some(handle) = mapped(candidate.0) { self.traversal_candidates.push_back(SleepCandidate(handle)); }
++        }
++    }
++
+     /// Creates a new empty island manager.
+     pub fn new() -> Self {
+         Self::default()
+@@ -192,6 +219,9 @@ impl IslandManager {
+                 rb.ids.active_island_id = id;
+                 rb.ids.active_set_id = target_island.bodies.len();
+                 target_island.bodies.push(handle);
++                // Preserve the strongest accuracy request when reusing a small awake island.
++                target_island.additional_solver_iterations = target_island
++                    .additional_solver_iterations.max(rb.additional_solver_iterations);
+             } else {
+                 let mut new_island = Island::singleton(handle, rb);
+                 let id = self.free_islands.pop().unwrap_or(self.islands.len());
+diff --git a/src/dynamics/mod.rs b/src/dynamics/mod.rs
+index 41e91da..362d01e 100644
+--- a/src/dynamics/mod.rs
++++ b/src/dynamics/mod.rs
+@@ -19,7 +19,7 @@ pub(crate) use self::solver::IslandSolver;
+ // pub(crate) use self::solver::ParallelIslandSolver;
+ pub use parry::mass_properties::MassProperties;
+ 
+-pub use self::rigid_body::{RigidBody, RigidBodyBuilder};
++pub use self::rigid_body::{RigidBody, RigidBodyBuilder, PlanetarySweepTrace, PlanetarySweepBounds};
+ pub use self::rigid_body_set::{BodyPair, RigidBodySet};
+ 
+ mod ccd;
+@@ -32,3 +32,127 @@ mod solver;
+ 
+ mod rigid_body;
+ mod rigid_body_set;
++
++#[cfg(all(test, feature = "dim3", feature = "f64"))]
++mod planetary_sweep_tests {
++// Regression coverage for the staged planetary collector. These tests exercise the actual
++// pipeline and CCD queries; the final capacity case isolates the explicit bounded accumulator.
++use crate::prelude::*;
++
++struct World {
++    pipeline: PhysicsPipeline,
++    bodies: RigidBodySet,
++    colliders: ColliderSet,
++    islands: IslandManager,
++    broad: BroadPhaseBvh,
++    narrow: NarrowPhase,
++    joints: ImpulseJointSet,
++    multibodies: MultibodyJointSet,
++    ccd: CCDSolver,
++}
++impl World {
++    fn new() -> Self {
++        Self { pipeline: PhysicsPipeline::new(), bodies: RigidBodySet::new(),
++            colliders: ColliderSet::new(), islands: IslandManager::new(), broad: BroadPhaseBvh::new(),
++            narrow: NarrowPhase::new(), joints: ImpulseJointSet::new(),
++            multibodies: MultibodyJointSet::new(), ccd: CCDSolver::new() }
++    }
++    fn body(&mut self, velocity: Vector) -> (RigidBodyHandle, ColliderHandle) {
++        let body = self.bodies.insert(RigidBodyBuilder::dynamic().linvel(velocity)
++            .ccd_enabled(true).soft_ccd_prediction(2.0).linear_damping(0.0).angular_damping(0.0));
++        let collider = self.colliders.insert_with_parent(ColliderBuilder::cuboid(0.125,0.125,0.125)
++            .mass(1.0).friction(0.0).restitution(0.0),body,&mut self.bodies);
++        self.bodies[body].recompute_mass_properties_from_colliders(&self.colliders);
++        (body,collider)
++    }
++    fn staged_clone(&self) -> Self {
++        assert!(self.bodies.iter().all(|(_,body)|body.planetary_sweep.is_none()));
++        Self { pipeline: PhysicsPipeline::new(), bodies: self.bodies.clone(), colliders: self.colliders.clone(),
++            islands: self.islands.clone(), broad: self.broad.clone(), narrow: self.narrow.clone(),
++            joints: self.joints.clone(), multibodies: self.multibodies.clone(), ccd: CCDSolver::new() }
++    }
++    fn step(&mut self, dt: Real) {
++        let parameters = IntegrationParameters {dt,max_ccd_substeps:4,..IntegrationParameters::default()};
++        self.pipeline.step(Vector::ZERO,&parameters,&mut self.islands,&mut self.broad,&mut self.narrow,
++            &mut self.bodies,&mut self.colliders,&mut self.joints,&mut self.multibodies,&mut self.ccd,&(),&());
++    }
++}
++fn same_bounds(a:&PlanetarySweepBounds,b:&PlanetarySweepBounds) {
++    assert_eq!(a.mins,b.mins);assert_eq!(a.maxs,b.maxs);assert_eq!(a.samples,b.samples);
++    assert_eq!(a.solver_segments,b.solver_segments);assert_eq!(a.ccd_predictions,b.ccd_predictions);
++    assert_eq!(a.ccd_clamps,b.ccd_clamps);assert_eq!(a.broad_phase_queries,b.broad_phase_queries);
++}
++
++#[test]
++fn planetary_sweep_fast_opposing_force_includes_real_ccd_query() {
++    let mut source=World::new();
++    let (body,_)=source.body(Vector::new(320.0,0.0,0.0));
++    // Establish the real previous CCD velocity via one actual step, not a fabricated
++    // internal activation flag; a newly allocated body's ccd_vels starts at zero.
++    source.step(0.001);
++    source.bodies[body].add_force(Vector::new(-6400.0,0.0,0.0),true);
++    let source_pose=*source.bodies[body].position();let source_velocity=source.bodies[body].linvel();
++    let mut candidate=source.staged_clone();let mut control=source.staged_clone();
++    let radius=Vector::splat(0.125).length();
++    let trace=candidate.bodies[body].planetary_begin_sweep(radius);
++    candidate.step(0.05);control.step(0.05);
++    let bounds=trace.snapshot().expect("actual pipeline collector must be readable");
++    // The first actual CCD pass predicts the initial fast velocity before this step's
++    // user force is assembled. Later solver integration decelerates. Final-only bounds
++    // would miss that real 16 m cast/query, even with no other dynamic body in the scene.
++    assert!(bounds.ccd_predictions>0,"no real CCD prediction was observed");
++    assert!(bounds.broad_phase_queries>0,"no real cached/query AABB was observed");
++    assert!(bounds.solver_segments>0,"no actual integration segment was observed");
++    assert!(bounds.maxs.x>=source_pose.translation.x+16.0+radius-1.0e-10,"initial fast CCD cast was omitted: {bounds:?}");
++    assert!(bounds.maxs.x>candidate.bodies[body].position().translation.x+radius+0.01,
++        "fixture did not separate internal CCD traversal from final pose");
++    // Recording must not alter the exact physical solve or mutate authoritative source.
++    assert_eq!(candidate.bodies[body].position(),control.bodies[body].position());
++    assert_eq!(candidate.bodies[body].linvel(),control.bodies[body].linvel());
++    assert_eq!(*source.bodies[body].position(),source_pose);assert_eq!(source.bodies[body].linvel(),source_velocity);
++    assert!(source.bodies[body].planetary_sweep.is_none());
++    candidate.bodies[body].planetary_end_sweep().unwrap();
++    candidate.pipeline=PhysicsPipeline::new();
++}
++
++#[test]
++fn planetary_sweep_deferred_offcenter_mass_change_refuses_stale_radius() {
++    let mut world=World::new();let (body,collider)=world.body(Vector::new(1.0,0.0,0.0));
++    assert_eq!(world.bodies[body].mprops.local_mprops.local_com,Vector::ZERO);
++    let trace=world.bodies[body].planetary_begin_sweep(0.25);
++    // This queues the real collider-parent and mass update; do not call the validator
++    // directly, because the regression is the pipeline's deferred user-change ordering.
++    world.colliders[collider].set_translation_wrt_parent(Vector::new(3.0,0.0,0.0));
++    world.step(0.01);
++    assert_eq!(world.bodies[body].mprops.local_mprops.local_com,Vector::new(3.0,0.0,0.0));
++    assert!(trace.snapshot().is_err(),"stale COM/radius was silently accepted");
++    world.bodies[body].planetary_end_sweep().unwrap();
++}
++
++#[test]
++fn planetary_sweep_solver_buffer_reuse_does_not_append_to_retired_trace() {
++    let mut world=World::new();let (body,_)=world.body(Vector::new(20.0,0.0,0.0));
++    let first=world.bodies[body].planetary_begin_sweep(0.25);world.step(0.025);
++    world.bodies[body].planetary_end_sweep().unwrap();let completed=first.snapshot().unwrap();
++    // Deliberately reuse the same real scratch pipeline here to exercise its clear/resize
++    // path. Production additionally replaces this scratch pipeline before publication.
++    let second=world.bodies[body].planetary_begin_sweep(0.25);world.step(0.025);
++    assert!(second.snapshot().unwrap().solver_segments>0);
++    same_bounds(&completed,&first.snapshot().unwrap());
++    world.bodies[body].planetary_end_sweep().unwrap();world.step(0.025);
++    same_bounds(&completed,&first.snapshot().unwrap());
++}
++
++#[test]
++fn planetary_sweep_capacity_exhaustion_invalidates_all_trace_handles() {
++    let mut body=RigidBodyBuilder::dynamic().build();let trace=body.planetary_begin_sweep(1.0);
++    let retained=trace.clone();
++    // begin_sweep recorded exactly the current and next pose. No allocation or silent
++    // truncation is permitted when another actual observation exceeds the fixed cap.
++    for _ in 2..65536 {trace.record_solver_segment(Vector::ZERO,Vector::X);}
++    assert_eq!(trace.snapshot().unwrap().samples,65536);
++    trace.record_solver_segment(Vector::ZERO,Vector::X);
++    assert!(trace.snapshot().is_err());assert!(retained.snapshot().is_err());
++}
++}
++
+diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_components.rs
+index 287307b..151e258 100644
+--- a/src/dynamics/rigid_body_components.rs
++++ b/src/dynamics/rigid_body_components.rs
+@@ -922,6 +922,8 @@ pub struct RigidBodyForces {
+     /// Gravity is multiplied by this scaling factor before it's
+     /// applied to this rigid-body.
+     pub gravity_scale: Real,
++    /// Optional planet-local gravity acceleration, independent of user forces.
++    pub planetary_gravity: Option<Vector>,
+     /// Forces applied by the user.
+     pub user_force: Vector,
+     /// Torque applied by the user.
+@@ -938,6 +940,7 @@ impl Default for RigidBodyForces {
+             force: Vector::ZERO,
+             torque: 0.0,
+             gravity_scale: 1.0,
++            planetary_gravity: None,
+             user_force: Vector::ZERO,
+             user_torque: 0.0,
+         };
+@@ -947,6 +950,7 @@ impl Default for RigidBodyForces {
+             force: Vector::ZERO,
+             torque: AngVector::ZERO,
+             gravity_scale: 1.0,
++            planetary_gravity: None,
+             user_force: Vector::ZERO,
+             user_torque: AngVector::ZERO,
+             gyroscopic_forces_enabled: false,
+@@ -975,7 +979,7 @@ impl RigidBodyForces {
+     /// Adds to `self` the gravitational force that would result in a gravitational acceleration
+     /// equal to `gravity`.
+     pub fn compute_effective_force_and_torque(&mut self, gravity: Vector, mass: Vector) {
+-        self.force = self.user_force + gravity * mass * self.gravity_scale;
++        self.force = self.user_force + self.planetary_gravity.unwrap_or(gravity * self.gravity_scale) * mass;
+         self.torque = self.user_torque;
+     }
+ 
 diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
+index 19d4c25..88b5644 100644
 --- a/src/dynamics/rigid_body_set.rs
 +++ b/src/dynamics/rigid_body_set.rs
 @@ -79,6 +79,42 @@ pub struct RigidBodySet {
@@ -45,9 +404,151 @@ diff --git a/src/dynamics/rigid_body_set.rs b/src/dynamics/rigid_body_set.rs
      ///
      /// Call this once when setting up your physics world. The collection will
 diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
+index 0f4ef43..9d49b1b 100644
 --- a/src/dynamics/rigid_body.rs
 +++ b/src/dynamics/rigid_body.rs
-@@ -734,6 +734,21 @@ impl RigidBody {
+@@ -18,6 +18,62 @@ use crate::utils::CrossProduct;
+ #[cfg(feature = "dim2")]
+ use crate::num::Zero;
+ 
++/// Bounded diagnostic envelope owned by one staged planetary body. This collector does not
++/// change integration or authorize publication; the scene preview owner checks residency.
++#[derive(Clone, Debug)]
++pub struct PlanetarySweepTrace {
++    inner: std::sync::Arc<std::sync::Mutex<PlanetarySweepBounds>>,
++    radius: Real,
++    local_com: Vector,
++}
++#[derive(Clone, Debug)]
++pub struct PlanetarySweepBounds {
++    pub mins: Vector,
++    pub maxs: Vector,
++    pub samples: u32,
++    pub solver_segments: u32,
++    pub ccd_predictions: u32,
++    pub ccd_clamps: u32,
++    pub broad_phase_queries: u32,
++    invalid: bool,
++}
++impl PlanetarySweepTrace {
++    fn record_bounds(&self, mins: Vector, maxs: Vector, kind: u8) {
++        // A poisoned trace remains unreadable: never turn missing observations into coverage.
++        if let Ok(mut trace) = self.inner.lock() {
++            if trace.invalid { return; }
++            if !mins.is_finite() || !maxs.is_finite() || !mins.cmple(maxs).all() || trace.samples == 65536 {
++                trace.invalid = true;
++                return;
++            }
++            trace.mins = trace.mins.min(mins);
++            trace.maxs = trace.maxs.max(maxs);
++            trace.samples += 1;
++            match kind {
++                1 => trace.solver_segments += 1,
++                2 => trace.ccd_predictions += 1,
++                3 => trace.ccd_clamps += 1,
++                4 => trace.broad_phase_queries += 1,
++                _ => {}
++            }
++        }
++    }
++    pub(crate) fn record_solver_segment(&self, start: Vector, end: Vector) {
++        let halo = Vector::splat(self.radius);
++        self.record_bounds(start.min(end) - halo, start.max(end) + halo, 1);
++    }
++    fn record_pose(&self, pose: &Pose, kind: u8) {
++        let center = pose.translation + pose.rotation * self.local_com;
++        let halo = Vector::splat(self.radius);
++        self.record_bounds(center - halo, center + halo, kind);
++    }
++    pub fn snapshot(&self) -> Result<PlanetarySweepBounds, &'static str> {
++        let trace = self.inner.lock().map_err(|_| "planetary sweep collector poisoned")?;
++        if trace.invalid || trace.samples == 0 { return Err("planetary sweep collector incomplete or exhausted"); }
++        Ok(trace.clone())
++    }
++}
++
+ #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+ /// A physical object that can move, rotate, and collide with other objects in your simulation.
+ ///
+@@ -65,6 +121,8 @@ pub struct RigidBody {
+     pub(crate) dominance: RigidBodyDominance,
+     pub(crate) enabled: bool,
+     pub(crate) additional_solver_iterations: usize,
++    #[cfg_attr(feature = "serde-serialize", serde(skip))]
++    pub(crate) planetary_sweep: Option<PlanetarySweepTrace>,
+     /// User-defined data associated to this rigid-body.
+     pub user_data: u128,
+ }
+@@ -76,6 +134,36 @@ impl Default for RigidBody {
+ }
+ 
+ impl RigidBody {
++    /// Start only after cloning the authoritative scene. Radius must enclose every collider
++    /// about the center of mass for arbitrary orientation, including the caller's query halo.
++    pub fn planetary_begin_sweep(&mut self, radius: Real) -> PlanetarySweepTrace {
++        assert!(radius.is_finite() && radius >= 0.0 && self.planetary_sweep.is_none());
++        let trace = PlanetarySweepTrace {
++            inner: std::sync::Arc::new(std::sync::Mutex::new(PlanetarySweepBounds {
++                mins: Vector::splat(Real::INFINITY), maxs: Vector::splat(Real::NEG_INFINITY),
++                samples: 0, solver_segments: 0, ccd_predictions: 0, ccd_clamps: 0,
++                broad_phase_queries: 0, invalid: false,
++            })), radius, local_com: self.mprops.local_mprops.local_com,
++        };
++        trace.record_pose(&self.pos.position, 0);
++        trace.record_pose(&self.pos.next_position, 0);
++        self.planetary_sweep = Some(trace.clone());
++        trace
++    }
++    pub fn planetary_end_sweep(&mut self) -> Option<PlanetarySweepTrace> { self.planetary_sweep.take() }
++    pub(crate) fn planetary_validate_sweep_mass(&self) {
++        if let Some(trace) = &self.planetary_sweep {
++            if trace.local_com != self.mprops.local_mprops.local_com {
++                if let Ok(mut bounds) = trace.inner.lock() { bounds.invalid = true; }
++            }
++        }
++    }
++    pub(crate) fn planetary_record_pose(&self, pose: &Pose, kind: u8) {
++        if let Some(trace) = &self.planetary_sweep { trace.record_pose(pose, kind); }
++    }
++    pub(crate) fn planetary_record_query(&self, aabb: &crate::geometry::Aabb) {
++        if let Some(trace) = &self.planetary_sweep { trace.record_bounds(aabb.mins, aabb.maxs, 4); }
++    }
+     fn new() -> Self {
+         Self {
+             pos: RigidBodyPosition::default(),
+@@ -94,6 +182,7 @@ impl RigidBody {
+             enabled: true,
+             user_data: 0,
+             additional_solver_iterations: 0,
++            planetary_sweep: None,
+         }
+     }
+ 
+@@ -137,6 +226,7 @@ impl RigidBody {
+             dominance,
+             enabled,
+             additional_solver_iterations,
++            planetary_sweep,
+             user_data,
+         } = other;
+ 
+@@ -152,6 +242,7 @@ impl RigidBody {
+         self.dominance = *dominance;
+         self.enabled = *enabled;
+         self.additional_solver_iterations = *additional_solver_iterations;
++        self.planetary_sweep = planetary_sweep.clone();
+         self.user_data = *user_data;
+ 
+         self.changes = RigidBodyChanges::all();
+@@ -555,6 +646,7 @@ impl RigidBody {
+             self.body_type,
+             &self.pos.position,
+         );
++        self.planetary_validate_sweep_mass();
+     }
+ 
+     /// Adds extra mass on top of collider-computed mass.
+@@ -734,6 +826,21 @@ impl RigidBody {
          }
      }
  
@@ -69,124 +570,106 @@ diff --git a/src/dynamics/rigid_body.rs b/src/dynamics/rigid_body.rs
      /// The dominance group of this rigid-body.
      pub fn dominance_group(&self) -> i8 {
          self.dominance.0
-diff --git a/src/dynamics/rigid_body_components.rs b/src/dynamics/rigid_body_components.rs
---- a/src/dynamics/rigid_body_components.rs
-+++ b/src/dynamics/rigid_body_components.rs
-@@ -922,6 +922,8 @@ pub struct RigidBodyForces {
-     /// Gravity is multiplied by this scaling factor before it's
-     /// applied to this rigid-body.
-     pub gravity_scale: Real,
-+    /// Optional planet-local gravity acceleration, independent of user forces.
-+    pub planetary_gravity: Option<Vector>,
-     /// Forces applied by the user.
-     pub user_force: Vector,
-     /// Torque applied by the user.
-@@ -938,6 +940,7 @@ impl Default for RigidBodyForces {
-             force: Vector::ZERO,
-             torque: 0.0,
-             gravity_scale: 1.0,
-+            planetary_gravity: None,
-             user_force: Vector::ZERO,
-             user_torque: 0.0,
-         };
-@@ -947,6 +950,7 @@ impl Default for RigidBodyForces {
-             force: Vector::ZERO,
-             torque: AngVector::ZERO,
-             gravity_scale: 1.0,
-+            planetary_gravity: None,
-             user_force: Vector::ZERO,
-             user_torque: AngVector::ZERO,
-             gyroscopic_forces_enabled: false,
-@@ -975,7 +979,7 @@ impl RigidBodyForces {
-     /// Adds to `self` the gravitational force that would result in a gravitational acceleration
-     /// equal to `gravity`.
-     pub fn compute_effective_force_and_torque(&mut self, gravity: Vector, mass: Vector) {
--        self.force = self.user_force + gravity * mass * self.gravity_scale;
-+        self.force = self.user_force + self.planetary_gravity.unwrap_or(gravity * self.gravity_scale) * mass;
-         self.torque = self.user_torque;
+diff --git a/src/dynamics/solver/solver_body.rs b/src/dynamics/solver/solver_body.rs
+index 47382ee..c8e8c43 100644
+--- a/src/dynamics/solver/solver_body.rs
++++ b/src/dynamics/solver/solver_body.rs
+@@ -75,17 +75,21 @@ macro_rules! scatter_unchecked(
+ pub struct SolverBodies {
+     pub vels: Vec<SolverVel<Real>>,
+     pub poses: Vec<SolverPose<Real>>,
++    pub(crate) planetary_sweeps: Vec<Option<crate::dynamics::PlanetarySweepTrace>>,
+ }
+ 
+ impl SolverBodies {
+     pub fn clear(&mut self) {
+         self.vels.clear();
+         self.poses.clear();
++        self.planetary_sweeps.clear();
      }
  
-diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
---- a/src/geometry/collider_set.rs
-+++ b/src/geometry/collider_set.rs
-@@ -53,6 +53,41 @@ pub struct ColliderSet {
- }
+     pub fn resize(&mut self, sz: usize) {
+         self.vels.resize(sz, Default::default());
+         self.poses.resize(sz, Default::default());
++        self.planetary_sweeps.resize(sz, None);
++        self.planetary_sweeps.fill(None);
+     }
  
- impl ColliderSet {
-+    /// Reserve insertion/removal bookkeeping before bounded static terrain replacement.
-+    pub fn planetary_reserve_static_batch(&mut self, count: usize) {
-+        let available = self.colliders.capacity() - self.colliders.len();
-+        if available < count { self.colliders.reserve(count - available); }
-+        self.modified_colliders.planetary_reserve(count);
-+        self.removed_colliders.reserve(count);
-+    }
-+    /// Used only after rebuilding the complete actor-free scene's spatial indexes.
-+    pub fn planetary_clear_static_changes(&mut self) {
-+        for (_, collider) in self.colliders.iter_mut() { collider.changes = ColliderChanges::empty(); }
-+        self.modified_colliders.clear();
-+        self.removed_colliders.clear();
-+    }
-+
-+    /// Insert a cloned collider without falsely invalidating its cached shape workspace.
-+    pub fn planetary_import_collider(&mut self, original: &Collider, parent: RigidBodyHandle, bodies: &mut RigidBodySet, delta: crate::math::Vector) -> ColliderHandle {
-+        let mut collider = original.clone();
-+        collider.parent.as_mut().expect("imported collider requires parent").handle = parent;
-+        collider.pos.0.translation -= delta;
-+        let handle = ColliderHandle(self.colliders.insert(collider));
-+        bodies.index_mut_internal(parent).colliders.0.push(handle);
-+        // A translated import is not a user position edit. Preserve genuine pending edits only.
-+        // Broad-phase insertion is performed separately by the transfer transaction.
-+        if original.changes.contains(ColliderChanges::IN_MODIFIED_SET) {
-+            self.modified_colliders.push_unchecked(handle, &mut self.colliders[handle.0]);
-+        }
-+        handle
-+    }
-+    /// Shift world poses only; collider-parent transforms and modification flags are unchanged.
-+    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
-+        for (_, collider) in self.colliders.iter_mut() {
-+            collider.pos.0.translation -= delta;
-+        }
-+    }
-+
-     /// Creates a new empty collection of colliders.
-     pub fn new() -> Self {
-         ColliderSet {
-diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
---- a/src/geometry/narrow_phase.rs
-+++ b/src/geometry/narrow_phase.rs
-@@ -83,6 +83,25 @@ impl Default for NarrowPhase {
- }
+     pub fn len(&self) -> usize {
+@@ -94,6 +98,10 @@ impl SolverBodies {
  
- impl NarrowPhase {
-+    /// Import remapped persistent contact data, including manifold workspaces and solver impulses.
-+    pub fn planetary_import_contact(&mut self, colliders: &ColliderSet, pair: ContactPair) {
-+        let a = pair.collider1;
-+        let b = pair.collider2;
-+        self.add_pair(colliders, &ColliderPair { collider1: a, collider2: b });
-+        let ga = self.graph_indices.get(a.0).unwrap().contact_graph_index;
-+        let gb = self.graph_indices.get(b.0).unwrap().contact_graph_index;
-+        let edge = self.contact_graph.graph.find_edge(ga, gb).unwrap();
-+        *self.contact_graph.graph.edge_weight_mut(edge).unwrap() = pair;
-+    }
-+    /// Contact anchors/warm starts are local. Only cached solver world points translate.
-+    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
-+        for edge in &mut self.contact_graph.graph.edges {
-+            for manifold in &mut edge.weight.manifolds {
-+                for contact in &mut manifold.data.solver_contacts { contact.point -= delta; }
+     // TODO: add a SIMD version?
+     pub fn copy_from(&mut self, _dt: Real, i: usize, rb: &RigidBody) {
++        // Validate immediately before copying the actual COM solver pose/trace together.
++        // This also covers callers that updated mass outside pipeline user-change handling.
++        rb.planetary_validate_sweep_mass();
++        self.planetary_sweeps[i] = rb.planetary_sweep.clone();
+         let poses = &mut self.poses[i];
+         let vels = &mut self.vels[i];
+ 
+diff --git a/src/dynamics/solver/velocity_solver.rs b/src/dynamics/solver/velocity_solver.rs
+index 66973ef..5ef0e5e 100644
+--- a/src/dynamics/solver/velocity_solver.rs
++++ b/src/dynamics/solver/velocity_solver.rs
+@@ -217,23 +217,32 @@ impl VelocitySolver {
+         bodies: &mut RigidBodySet,
+         multibodies: &mut MultibodyJointSet,
+     ) {
+-        for (solver_vels, solver_pose) in self
++        // Diagnostic bookkeeping must never silently shorten the original physics loop.
++        // Refuse before the first integration if its parallel trace slots are inconsistent.
++        assert_eq!(self.solver_bodies.vels.len(), self.solver_bodies.poses.len());
++        assert_eq!(self.solver_bodies.poses.len(), self.solver_bodies.planetary_sweeps.len());
++        let planetary_sweeps = &self.solver_bodies.planetary_sweeps;
++        for (index, (solver_vels, solver_pose)) in self
+             .solver_bodies
+             .vels
+             .iter()
+             .zip(self.solver_bodies.poses.iter_mut())
++            .enumerate()
+         {
++            let planetary_sweep = &planetary_sweeps[index];
+             let linvel = solver_vels.linear;
+             let angvel = solver_vels.angular;
+ 
+             // TODO: should we add a compile flag (or a simulation parameter)
+             //       to disable the rotation linearization?
+             let new_vels = RigidBodyVelocity { linvel, angvel };
++            let planetary_start = solver_pose.translation;
+             new_vels.integrate_linearized(
+                 params.dt,
+                 &mut solver_pose.translation,
+                 &mut solver_pose.rotation,
+             );
++            if let Some(trace) = planetary_sweep { trace.record_solver_segment(planetary_start, solver_pose.translation); }
+         }
+ 
+         // TODO PERF: SIMD-optimized integration. Works fine, but doesn’t run faster than the scalar
+diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
+index 23abb79..7c2507e 100644
+--- a/src/geometry/broad_phase_bvh.rs
++++ b/src/geometry/broad_phase_bvh.rs
+@@ -53,6 +53,70 @@ pub enum BvhOptimizationStrategy {
+ const ENABLE_TREE_VALIDITY_CHECK: bool = false;
+ 
+ impl BroadPhaseBvh {
++    /// Observe the exact BVH leaves used by pair/CCD queries. A leaf can retain padding or
++    /// an earlier prediction even when its collider did not change this step; recomputing
++    /// its current shape AABB or merely adding the nominal skin is not the same bound.
++    /// CCD callers invoke this after their leaf updates and before creating a query pipeline.
++    pub(crate) fn planetary_record_cached_aabbs(&self, bodies: &RigidBodySet, colliders: &ColliderSet) {
++        for (body_handle, body) in bodies.iter() {
++            if body.planetary_sweep.is_none() { continue; }
++            for handle in body.colliders() {
++                let Some(collider) = colliders.get(*handle) else { continue; };
++                if !collider.is_enabled() || collider.parent() != Some(body_handle) { continue; }
++                if let Some(leaf) = self.tree.leaf_node(handle.into_raw_parts().0) {
++                    body.planetary_record_query(&leaf.aabb());
++                }
 +            }
 +        }
 +    }
 +
-     /// Creates a new empty narrow-phase.
-     pub fn new() -> Self {
-         Self::with_query_dispatcher(DefaultQueryDispatcher)
-diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
---- a/src/geometry/broad_phase_bvh.rs
-+++ b/src/geometry/broad_phase_bvh.rs
-@@ -53,6 +53,53 @@ pub enum BvhOptimizationStrategy {
- const ENABLE_TREE_VALIDITY_CHECK: bool = false;
- 
- impl BroadPhaseBvh {
 +    /// Consume only exact retired collider identities before a transfer reuses arena slots.
 +    /// Keep live padded leaves/pairs and the frame clock; this is not a simulation step.
 +    pub fn planetary_remove_colliders(&mut self, params: &IntegrationParameters, bodies: &RigidBodySet, colliders: &ColliderSet, removed: &[ColliderHandle]) {
@@ -237,62 +720,130 @@ diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
      const CHANGE_DETECTION_ENABLED: bool = true;
      const CHANGE_DETECTION_FACTOR: Real = 1.0e-2;
  
-diff --git a/src/dynamics/island_manager/manager.rs b/src/dynamics/island_manager/manager.rs
---- a/src/dynamics/island_manager/manager.rs
-+++ b/src/dynamics/island_manager/manager.rs
-@@ -47,6 +47,33 @@
+@@ -161,6 +225,9 @@ impl BroadPhaseBvh {
+         // let t0 = std::time::Instant::now();
+         self.tree.refit(&mut self.workspace);
+ 
++        // This includes cached/imported leaves that the modified-collider loop skipped.
++        self.planetary_record_cached_aabbs(bodies, colliders);
++
+         if ENABLE_TREE_VALIDITY_CHECK {
+             self.tree.assert_well_formed();
+         }
+diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
+index 2de2803..53178e1 100644
+--- a/src/geometry/collider_set.rs
++++ b/src/geometry/collider_set.rs
+@@ -53,6 +53,41 @@ pub struct ColliderSet {
  }
  
- impl IslandManager {
-+    /// Import source island membership in source order, retaining sleep components and candidates.
-+    /// The caller has already proved that active contacts/joints cannot cross the selected group.
-+    pub fn planetary_import_islands(&mut self, source: &Self, bodies: &mut RigidBodySet, remap: &[(RigidBodyHandle, RigidBodyHandle)]) {
-+        let mapped = |old: RigidBodyHandle| remap.iter().find(|(a, _)| *a == old).map(|(_, b)| *b);
-+        for (_, original) in source.islands.iter() {
-+            let handles: Vec<_> = original.bodies.iter().filter_map(|h| mapped(*h)).collect();
-+            if handles.is_empty() { continue; }
-+            let mut imported = original.clone();
-+            imported.bodies = handles;
-+            let id = self.free_islands.pop().unwrap_or(self.islands.len());
-+            imported.id_in_awake_list = if original.is_sleeping() { None } else {
-+                let awake = self.awake_islands.len(); self.awake_islands.push(id); Some(awake)
-+            };
-+            for (index, handle) in imported.bodies.iter().enumerate() {
-+                let rb = bodies.index_mut_internal(*handle);
-+                rb.ids.active_island_id = id;
-+                rb.ids.active_set_id = index;
-+                // Timestamp is a destination traversal marker, not transferable physical state.
-+                rb.ids.active_set_timestamp = self.traversal_timestamp.wrapping_sub(1);
-+            }
-+            self.islands.insert(id, imported);
+ impl ColliderSet {
++    /// Reserve insertion/removal bookkeeping before bounded static terrain replacement.
++    pub fn planetary_reserve_static_batch(&mut self, count: usize) {
++        let available = self.colliders.capacity() - self.colliders.len();
++        if available < count { self.colliders.reserve(count - available); }
++        self.modified_colliders.planetary_reserve(count);
++        self.removed_colliders.reserve(count);
++    }
++    /// Used only after rebuilding the complete actor-free scene's spatial indexes.
++    pub fn planetary_clear_static_changes(&mut self) {
++        for (_, collider) in self.colliders.iter_mut() { collider.changes = ColliderChanges::empty(); }
++        self.modified_colliders.clear();
++        self.removed_colliders.clear();
++    }
++
++    /// Insert a cloned collider without falsely invalidating its cached shape workspace.
++    pub fn planetary_import_collider(&mut self, original: &Collider, parent: RigidBodyHandle, bodies: &mut RigidBodySet, delta: crate::math::Vector) -> ColliderHandle {
++        let mut collider = original.clone();
++        collider.parent.as_mut().expect("imported collider requires parent").handle = parent;
++        collider.pos.0.translation -= delta;
++        let handle = ColliderHandle(self.colliders.insert(collider));
++        bodies.index_mut_internal(parent).colliders.0.push(handle);
++        // A translated import is not a user position edit. Preserve genuine pending edits only.
++        // Broad-phase insertion is performed separately by the transfer transaction.
++        if original.changes.contains(ColliderChanges::IN_MODIFIED_SET) {
++            self.modified_colliders.push_unchecked(handle, &mut self.colliders[handle.0]);
 +        }
-+        for candidate in &source.traversal_candidates {
-+            if let Some(handle) = mapped(candidate.0) { self.traversal_candidates.push_back(SleepCandidate(handle)); }
++        handle
++    }
++    /// Shift world poses only; collider-parent transforms and modification flags are unchanged.
++    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
++        for (_, collider) in self.colliders.iter_mut() {
++            collider.pos.0.translation -= delta;
 +        }
 +    }
 +
-     /// Creates a new empty island manager.
+     /// Creates a new empty collection of colliders.
      pub fn new() -> Self {
-         Self::default()
-@@ -192,6 +219,9 @@
-                 rb.ids.active_island_id = id;
-                 rb.ids.active_set_id = target_island.bodies.len();
-                 target_island.bodies.push(handle);
-+                // Preserve the strongest accuracy request when reusing a small awake island.
-+                target_island.additional_solver_iterations = target_island
-+                    .additional_solver_iterations.max(rb.additional_solver_iterations);
-             } else {
-                 let mut new_island = Island::singleton(handle, rb);
-                 let id = self.free_islands.pop().unwrap_or(self.islands.len());
-diff --git a/src/data/modified_objects.rs b/src/data/modified_objects.rs
---- a/src/data/modified_objects.rs
-+++ b/src/data/modified_objects.rs
-@@ -34,6 +34,8 @@ impl<Handle, Object> Deref for ModifiedObjects<Handle, Object> {
+         ColliderSet {
+diff --git a/src/geometry/collider.rs b/src/geometry/collider.rs
+index 43e8ba9..62cc4b9 100644
+--- a/src/geometry/collider.rs
++++ b/src/geometry/collider.rs
+@@ -595,6 +595,9 @@ impl Collider {
+             aabb.merge(&next_aabb);
+         }
+ 
++        if let Some(parent) = self.parent.and_then(|p| bodies.get(p.handle)) {
++            parent.planetary_record_query(&aabb);
++        }
+         aabb
+     }
+ 
+diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
+index 7fe12c5..b952b8f 100644
+--- a/src/geometry/narrow_phase.rs
++++ b/src/geometry/narrow_phase.rs
+@@ -83,6 +83,25 @@ impl Default for NarrowPhase {
  }
  
- impl<Handle, Object: HasModifiedFlag> ModifiedObjects<Handle, Object> {
-+    /// Reserve bounded mutation metadata before a planetary publication transaction.
-+    pub fn planetary_reserve(&mut self, additional: usize) { self.0.reserve(additional); }
-     /// Preallocate memory for `capacity` handles
-     pub fn with_capacity(capacity: usize) -> Self {
-         Self(Vec::with_capacity(capacity), PhantomData)
+ impl NarrowPhase {
++    /// Import remapped persistent contact data, including manifold workspaces and solver impulses.
++    pub fn planetary_import_contact(&mut self, colliders: &ColliderSet, pair: ContactPair) {
++        let a = pair.collider1;
++        let b = pair.collider2;
++        self.add_pair(colliders, &ColliderPair { collider1: a, collider2: b });
++        let ga = self.graph_indices.get(a.0).unwrap().contact_graph_index;
++        let gb = self.graph_indices.get(b.0).unwrap().contact_graph_index;
++        let edge = self.contact_graph.graph.find_edge(ga, gb).unwrap();
++        *self.contact_graph.graph.edge_weight_mut(edge).unwrap() = pair;
++    }
++    /// Contact anchors/warm starts are local. Only cached solver world points translate.
++    pub fn planetary_shift_origin(&mut self, delta: crate::math::Vector) {
++        for edge in &mut self.contact_graph.graph.edges {
++            for manifold in &mut edge.weight.manifolds {
++                for contact in &mut manifold.data.solver_contacts { contact.point -= delta; }
++            }
++        }
++    }
++
+     /// Creates a new empty narrow-phase.
+     pub fn new() -> Self {
+         Self::with_query_dispatcher(DefaultQueryDispatcher)
+diff --git a/src/pipeline/physics_pipeline.rs b/src/pipeline/physics_pipeline.rs
+index 9b6e5ac..02e78d3 100644
+--- a/src/pipeline/physics_pipeline.rs
++++ b/src/pipeline/physics_pipeline.rs
+@@ -404,6 +404,7 @@ impl PhysicsPipeline {
+         for handle in islands.active_bodies() {
+             let rb = bodies.index_mut_internal(handle);
+             rb.pos.position = rb.pos.next_position;
++            rb.planetary_record_pose(&rb.pos.position, 0);
+             rb.colliders
+                 .update_positions(colliders, modified_colliders, &rb.pos.position);
+         }
+diff --git a/src/pipeline/user_changes.rs b/src/pipeline/user_changes.rs
+index 47a76a3..606bcbf 100644
+--- a/src/pipeline/user_changes.rs
++++ b/src/pipeline/user_changes.rs
+@@ -146,6 +146,10 @@ pub(crate) fn handle_user_changes_to_rigid_bodies(
+                     rb.body_type,
+                     &rb.pos.position,
+                 );
++                // A staged sweep radius is measured about the COM captured at admission.
++                // Deferred collider/mass changes must invalidate that proof if COM changed;
++                // they must never silently relabel already recorded solver/query bounds.
++                rb.planetary_validate_sweep_mass();
+             }
+ 
+             rb.activation = activation;
