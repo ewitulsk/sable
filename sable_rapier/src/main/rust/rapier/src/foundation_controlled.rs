@@ -24,6 +24,8 @@ struct Input {
     segments: Vec<MotorSegment>,
     active_segment: usize,
     applied_motor_delta: Vec3,
+    terminal: Option<Vec<i64>>,
+    terminal_supported: bool,
     // Actual force events from all CCD subdivisions; never endpoint support contacts.
     events: Vec<[i64; 16]>,
 }
@@ -52,6 +54,7 @@ struct Peer { body: i64, epoch: i64, actor: i64, kind: i64, registration: i64 }
 struct EventBuffer {
     counts: HashMap<i64, usize>,
     rows: Vec<(i64, [i64; 16])>,
+    terminal_ineligible: std::collections::HashSet<i64>,
     failed: bool,
 }
 pub(super) struct StepEvents {
@@ -65,7 +68,7 @@ impl StepEvents {
         let region = transfer::lookup(registry, scene)?;
         if !owns_scene(&registry.controlled, scene) {
             return Ok(Self { start: region.time_nanos, end, peers: HashMap::new(),
-                buffer: Mutex::new(EventBuffer { counts: HashMap::new(), rows: Vec::new(), failed: false }) });
+                buffer: Mutex::new(EventBuffer { counts: HashMap::new(), rows: Vec::new(), terminal_ineligible: std::collections::HashSet::new(), failed: false }) });
         }
         if region.bodies.len() > 4096 || region.sections.len() > MAX_SECTIONS {
             return Err("interval history body/terrain registry cap".into());
@@ -90,7 +93,7 @@ impl StepEvents {
             capacity += MAX_CONTACTS - input.events.len();
         }
         Ok(Self { start: region.time_nanos, end, peers,
-            buffer: Mutex::new(EventBuffer { counts, rows: Vec::with_capacity(capacity), failed: false }) })
+            buffer: Mutex::new(EventBuffer { counts, rows: Vec::with_capacity(capacity), terminal_ineligible: std::collections::HashSet::with_capacity(MAX_PLAYERS+MAX_ITEMS), failed: false }) })
     }
     pub(super) fn finish(self, registry: &mut Registry, scene: i64) -> Result<(), String> {
         let mut buffer = self.buffer.into_inner().map_err(|_|"interval contact collector poisoned")?;
@@ -101,6 +104,10 @@ impl StepEvents {
             let actor = registry.controlled.actors.get_mut(&id).ok_or("interval event actor vanished")?;
             if actor.scene != scene { return Err("interval event actor changed scene".into()); }
             actor.input.as_mut().ok_or("interval event input vanished")?.events.push(event);
+        }
+        for id in buffer.terminal_ineligible {
+            registry.controlled.actors.get_mut(&id).ok_or("terminal contact actor vanished")?
+                .input.as_mut().ok_or("terminal contact input vanished")?.terminal_supported=false;
         }
         if buffer.failed { return Err("interval contact history overflow or invalid native event; scene retained".into()); }
         Ok(())
@@ -138,6 +145,11 @@ impl EventHandler for StepEvents {
             }
             for (recipient, other, collider, outward) in [(a,b,pair.collider2,-normal),(b,a,pair.collider1,normal)] {
                 if recipient.actor == 0 { continue; }
+                // Combine-rule precedence on the OTHER collider can override Min. Preserve
+                // actual solved coefficients, including contacts gone before the endpoint.
+                if manifold.data.solver_contacts.iter().any(|contact|contact.friction!=0. || contact.restitution!=0.) {
+                    buffer.terminal_ineligible.insert(recipient.actor);
+                }
                 let Some(count) = buffer.counts.get_mut(&recipient.actor) else { buffer.failed=true; return; };
                 if *count >= MAX_CONTACTS { buffer.failed=true; return; }
                 *count += 1;
@@ -540,6 +552,32 @@ pub(super) fn after_step(registry: &mut Registry, scene: i64) -> Result<(), Stri
     }
     Ok(())
 }
+/// The new controller impulse is perpendicular to every actual positive-impulse normal.
+/// Actual solver velocity is never projected or interpreted as separable motor/response parts.
+fn terminal_projection(actual:Vec3,drive:Vec3,target:Vec3,events:&[[i64;16]]) -> Result<(Vec3,usize),String> {
+    if actual.length()>MAX_SPEED || drive.length()>MAX_SPEED || target.length()>MAX_SPEED || events.len()>MAX_CONTACTS {
+        return Err("terminal motor speed/contact bound".into());
+    }
+    let remove=|mut value:Vec3,basis:&[Vec3]| {
+        for _ in 0..2 { for axis in basis { value-=*axis*value.dot(*axis); } }value
+    };
+    let mut basis:Vec<Vec3>=Vec::with_capacity(3);let mut normals=Vec::with_capacity(events.len());
+    for event in events {
+        let normal=Vec3::new(f64::from_bits(event[12] as u64),f64::from_bits(event[13] as u64),f64::from_bits(event[14] as u64));
+        if !normal.is_finite() || (normal.length()-1.).abs()>1e-6 { return Err("invalid retained contact normal".into()); }
+        normals.push(normal);
+        if basis.len()<3 { let independent=remove(normal,&basis);let length=independent.length();
+            if length>1e-12 { basis.push(independent/length); }
+        }
+    }
+    let correction=if basis.len()==3 {Vec3::ZERO}else{remove(target-drive,&basis)};
+    if !correction.is_finite() || normals.iter().any(|normal|correction.dot(*normal).abs()>1e-8) {
+        return Err("terminal projection failed actual contact constraint".into());
+    }
+    let after=actual+correction;
+    if !after.is_finite() || after.length()>MAX_SPEED { return Err("terminal motor plus retained response exceeds speed envelope".into()); }
+    Ok((correction,basis.len()))
+}
 pub(super) fn dispatch(
     registry: &mut Registry,
     scene: i64,
@@ -547,10 +585,65 @@ pub(super) fn dispatch(
     ids: &[i64],
     values: &[f64],
 ) -> Result<Vec<i64>, String> {
-    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77) {
+    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77 | 79) {
         return Err("controlled actor mutation forbidden during transfer staging".into());
     }
     match op {
+        78 => {
+            if ids.len()!=10 { return Err("terminal motor requires exact complete input receipt".into()); }
+            require(values,6)?;
+            let a=actor(registry,scene,ids)?;
+            let region=transfer::lookup(registry,scene)?;
+            let input=a.input.as_ref().ok_or("terminal motor input absent")?;
+            let result=a.result.as_ref().ok_or("terminal motor requires completed result")?;
+            if a.kind!=1 || !input.terminal_supported || result[11..14]!=ids[7..10] || input.end!=region.time_nanos {
+                return Err("terminal motor requires exact completed PLAYER input".into());
+            }
+            let expected=vec(values,0)?;let target=vec(values,3)?;
+            if let Some(receipt)=&input.terminal {
+                if receipt[14..17]!=vector_bits(expected) || receipt[20..23]!=vector_bits(target)
+                    || receipt[26..29]!=vector_bits(actor_body(region,a)?.linvel()) {
+                    return Err("terminal motor replay differs from retained original request/state".into());
+                }
+                return Ok(receipt.clone());
+            }
+            let body=actor_body(region,a)?;
+            if body.linvel()!=expected || result[21..24]!=vector_bits(expected) {
+                return Err("terminal motor actual velocity CAS mismatch".into());
+            }
+            // This controller policy assumes the actual actor collider contract, not a
+            // guessed friction impulse decomposition from endpoint velocities.
+            if body.colliders().len()!=1 { return Err("terminal motor actor collider shape changed".into()); }
+            let collider=&region.sim.collider_set[body.colliders()[0]];
+            if collider.friction()!=0. || collider.friction_combine_rule()!=CoefficientCombineRule::Min
+                || collider.restitution()!=0. || collider.restitution_combine_rule()!=CoefficientCombineRule::Min {
+                return Err("terminal motor requires retained frictionless actor contract".into());
+            }
+            let drive=input.segments.last().map_or(input.velocity,|segment|segment.velocity);
+            let (correction,rank)=terminal_projection(expected,drive,target,&input.events)?;
+            let after=expected+correction;
+            let next_mutation=region.mutation.checked_add(1).ok_or("terminal motor mutation exhausted")?;
+            let key=a.body;
+            let mut receipt=result[..14].to_vec();
+            receipt.extend(vector_bits(expected));receipt.extend(vector_bits(drive));receipt.extend(vector_bits(target));
+            receipt.extend(vector_bits(correction));receipt.extend(vector_bits(after));receipt.push(rank as i64);
+            let region=registry.scenes.get_mut(&scene).unwrap();
+            region.sim.rigid_body_set[region.bodies[&key]].set_linvel(after,true);
+            region.mutation=next_mutation;
+            let a=registry.controlled.actors.get_mut(&ids[0]).unwrap();
+            a.result.as_mut().unwrap()[21..24].copy_from_slice(&vector_bits(after));
+            let input=a.input.as_mut().unwrap();input.applied_motor_delta+=correction;input.terminal=Some(receipt.clone());
+            // Existing netImpulse remains external momentum; the explicit terminal motor
+            // correction belongs to the controller and is recorded separately above.
+            Ok(receipt)
+        }
+        79 => {
+            if ids.len()!=10 { return Err("terminal receipt lookup requires exact input".into()); }
+            require(values,0)?;let a=actor(registry,scene,ids)?;
+            let result=a.result.as_ref().ok_or("terminal result absent")?;
+            if result[11..14]!=ids[7..10] { return Err("terminal lookup input differs".into()); }
+            Ok(a.input.as_ref().ok_or("terminal input absent")?.terminal.clone().unwrap_or_default())
+        }
         74 => {
             if !ids.is_empty() { return Err("segmented capability takes no identities".into()); }
             require(values, 0)?;
@@ -593,7 +686,7 @@ pub(super) fn dispatch(
             registry.controlled.actors.get_mut(&ids[0]).unwrap().input = Some(Input {
                 sequence: ids[7], start: ids[8], end: ids[9], velocity,
                 started: false, initial_velocity: velocity, segments, active_segment: 0,
-                applied_motor_delta: Vec3::ZERO, events: Vec::with_capacity(MAX_CONTACTS),
+                applied_motor_delta: Vec3::ZERO, terminal: None, terminal_supported: true, events: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])
         }
@@ -815,6 +908,8 @@ pub(super) fn dispatch(
                 segments: Vec::new(),
                 active_segment: 0,
                 applied_motor_delta: Vec3::ZERO,
+                terminal: None,
+                terminal_supported: true,
                 events: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])
@@ -828,7 +923,7 @@ pub(super) fn dispatch(
             Ok(a.result.clone().unwrap_or_default())
         }
         45 => {
-            if ids.len() != 10 {
+            if ids.len() != 10 && ids.len() != 13 {
                 return Err(
                     "controlled acknowledgement needs exact owner/input/clock receipt".into(),
                 );
@@ -838,6 +933,11 @@ pub(super) fn dispatch(
             let result = a.result.as_ref().ok_or("controlled result absent")?;
             if result[11..14] != ids[7..10] {
                 return Err("controlled result acknowledgement mismatch".into());
+            }
+            match &a.input.as_ref().ok_or("acknowledged input absent")?.terminal {
+                Some(receipt) if ids.len()==13 && ids[10..13]==receipt[20..23] => {},
+                None if ids.len()==10 => {},
+                _ => return Err("terminal-adjusted result requires its exact terminal-aware ACK".into()),
             }
             let a = registry.controlled.actors.get_mut(&ids[0]).unwrap();
             a.last_sequence = ids[7];

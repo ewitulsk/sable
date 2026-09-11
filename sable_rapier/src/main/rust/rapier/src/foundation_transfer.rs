@@ -355,7 +355,7 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64,mapped:b
 pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->Result<Vec<i64>,String> {
     if (60..=69).contains(&op) { return preview::dispatch(registry,scene,op,ids,values); }
     if registry.preview.is_some()&&matches!(op,4|51){return Err("staged interval retains bounded transfer staging capacity".into());}
-    if preview::retains(registry,scene)&&!matches!(op,0|3|7|8|11|13|20|22|30|35|40|42|44|49|50|56|57|58|74|76|77|90){return Err("staged interval retains native scene mutations".into());}
+    if preview::retains(registry,scene)&&!matches!(op,0|3|7|8|11|13|20|22|30|35|40|42|44|49|50|56|57|58|74|76|77|79|90){return Err("staged interval retains native scene mutations".into());}
     if mapping_retains(registry,scene)&&!matches!(op,0|3|7|8|11|13|20|22|30|35|40|42|44|49|50|52|53|54|56|57|58){return Err("mapped transfer receipt retains scene mutations".into());}
     if matches!(op,1|2|14){controlled::transfer_ready(registry,scene,scene)?;}
     match op {
@@ -569,9 +569,9 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
         },
         20..=27 => character::dispatch(registry,scene,op,ids,values),
         30..=35 => {controlled::transfer_ready(registry,scene,scene)?;terrain_batch::dispatch(registry,scene,op,ids,values)},
-        40..=49 | 57 | 58 | 74..=77 => controlled::dispatch(registry,scene,op,ids,values),
+        40..=49 | 57 | 58 | 74..=79 => controlled::dispatch(registry,scene,op,ids,values),
         90 => controlled_pose::dispatch(registry,scene,op,ids,values),
-        91 => Err("feet-anchored transition requires an unadvanced staged scene".into()),
+        91|92 => Err("feet-anchored transition requires an unadvanced staged scene".into()),
         _=>Err("unknown typed foundation operation".into()),
     }
 }
