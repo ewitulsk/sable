@@ -40,6 +40,15 @@ impl Resources {
 }
 
 impl Simulation {
+    /// Settle exact retired collider generations in a staged owner before reusing arena slots.
+    /// This is maintenance of deferred removals, not a simulation step or a contact reset.
+    fn flush_pending_removals(&mut self) {
+        let removed=self.collider_set.take_removed();
+        if removed.is_empty(){return;}
+        self.narrow_phase.handle_user_changes(Some(&mut self.island_manager),&[],&removed,
+            &mut self.collider_set,&mut self.rigid_body_set,&());
+        self.broad_phase.planetary_remove_colliders(&self.parameters,&self.rigid_body_set,&self.collider_set,&removed);
+    }
     fn initialize_static_indexes(&mut self) {
         // With no actors/constraints there is no solver state to preserve. Rebuilding the indexes
         // also removes retired actors' deferred contacts and acknowledges exact current terrain.
@@ -60,12 +69,19 @@ impl Simulation {
 
 pub(super) struct PreparedTransfer {
     id:i64, source:i64, destination:i64, source_mutation:i64, destination_mutation:i64,
-    source_epoch:i64, destination_epoch:i64, time_nanos:i64,
+    source_epoch:i64, destination_epoch:i64, time_nanos:i64, destination_time_nanos:i64,
     source_sim:Simulation, destination_sim:Simulation,
     source_bodies:HashMap<i64,RigidBodyHandle>, destination_bodies:HashMap<i64,RigidBodyHandle>,
     source_epochs:HashMap<i64,i64>, destination_epochs:HashMap<i64,i64>,
+    source_history:HashMap<i64,time::BodyHistory>, destination_history:HashMap<i64,time::BodyHistory>,
     source_joints:HashMap<i64,ImpulseJointHandle>, destination_joints:HashMap<i64,ImpulseJointHandle>,
     resources:Resources, moved_bodies:usize, moved_joints:usize, moved_contacts:usize,
+    mapping:Option<MappedPreparation>,
+}
+struct MappedPreparation {receipt:Vec<i64>,legacy:Vec<character::MappedActor>}
+pub(super) struct RetainedMapping {id:i64,source:i64,destination:i64,receipt:Vec<i64>}
+pub(super) fn mapping_retains(registry:&Registry,scene:i64)->bool{
+    registry.mapped_receipt.as_ref().is_some_and(|r|r.source==scene||r.destination==scene)
 }
 
 pub(super) fn retire_scene(registry:&mut Registry,scene:i64) {
@@ -131,7 +147,7 @@ pub(super) fn body_state(region:&Region,key:i64,ownership:i64)->Result<Vec<f64>,
     }
     Ok(values)
 }
-fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result<PreparedTransfer,String> {
+fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64,mapped:bool)->Result<PreparedTransfer,String> {
     require(v,3)?; let delta=vec(v,0)?;
     if args.len()<5 { return Err("incomplete transfer descriptor".into()); }
     let destination_id=args[0];
@@ -139,10 +155,10 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result
     if source_id==destination_id { return Err("transfer requires distinct scenes".into()); }
     let source=lookup(registry,source_id)?; let destination=lookup(registry,destination_id)?;
     if source.epoch!=args[1] || destination.epoch!=args[2] { return Err("stale transfer frame".into()); }
-    if source.time_nanos!=destination.time_nanos { return Err("scene simulation clocks differ".into()); }
+    if !mapped&&source.time_nanos!=destination.time_nanos { return Err("scene simulation clocks differ".into()); }
     if source.sim.gravity!=destination.sim.gravity { return Err("scene gravity mismatch; use common scene field and body overrides".into()); }
     let count=usize::try_from(args[3]).map_err(|_|"invalid body count")?;
-    if count==0 || count>4096 || args.len()<5+count { return Err("invalid transfer group size".into()); }
+    if count==0&&!mapped || count>4096 || args.len()<5+count { return Err("invalid transfer group size".into()); }
     let ids=&args[4..4+count];
     let links=usize::try_from(args[4+count]).map_err(|_|"invalid collision link count")?;
     if links>4096 || args.len()!=5+count+links*4 { return Err("invalid collision readiness links".into()); }
@@ -153,6 +169,9 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result
         if !selected.insert(body) { return Err("duplicate transfer body".into()); }
         if destination.bodies.contains_key(stable) { return Err("destination already owns body identity".into()); }
     }
+    let selected_ids:HashSet<_>=ids.iter().copied().collect();
+    if !controlled::mapped_actor_words(&registry.controlled,source_id,&selected_ids).is_empty()
+        &&character::owns_scene(&registry.characters,destination_id){return Err("controlled transfer cannot mix destination legacy witnesses".into());}
     let mut body_remap=HashMap::new(); let mut collider_remap=HashMap::new(); let mut mapped_sections=HashSet::new();
     for link in args[5+count..].chunks_exact(4) {
         let a=source.sections.get(&link[0]).ok_or("missing source collision lease")?;
@@ -181,10 +200,17 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result
         }
     }
     if destination.sim.impulse_joint_set.len()+moved_joints.len()>4096 { return Err("destination joint capacity exhausted".into()); }
+    // Bound both complete solver clones before allocating them. Pending removal queues and old
+    // narrow-phase graph entries must be settled before contact reads or imported slot reuse.
+    let mut live=Resources::default();for region in registry.scenes.values(){live.add(Resources::scene(&region.sim));}
+    let mut staging=Resources::scene(&source.sim);staging.add(Resources::scene(&destination.sim));
+    let mut peak=live;peak.add(staging);peak.bounded()?;
+    let mut source_sim=source.sim.staged_clone();let mut destination_sim=destination.sim.staged_clone();
+    source_sim.flush_pending_removals();destination_sim.flush_pending_removals();
     let mut contacts=Vec::new();
-    for pair in source.sim.narrow_phase.contact_pairs() {
-        let a=source.sim.collider_set[pair.collider1].parent();
-        let b=source.sim.collider_set[pair.collider2].parent();
+    for pair in source_sim.narrow_phase.contact_pairs() {
+        let a=source_sim.collider_set.get(pair.collider1).ok_or("staged contact retained retired first collider")?.parent();
+        let b=source_sim.collider_set.get(pair.collider2).ok_or("staged contact retained retired second collider")?.parent();
         let sa=a.is_some_and(|h|selected.contains(&h)); let sb=b.is_some_and(|h|selected.contains(&h));
         if !sa&&!sb { continue; }
         for other in [a.filter(|_|!sa),b.filter(|_|!sb)].into_iter().flatten() {
@@ -226,32 +252,30 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result
             }}}
         }
     }
-    let mut live=Resources::default();for region in registry.scenes.values(){live.add(Resources::scene(&region.sim));}
-    let mut staging=Resources::scene(&source.sim);staging.add(Resources::scene(&destination.sim));
-    let mut peak=live;peak.add(staging);
     // Destination imports temporarily coexist with staged source copies until source removal.
     let extra_colliders=selected.iter().map(|h|source.sim.rigid_body_set[*h].colliders().len()).sum();
     let mut extra=Resources {bodies:count,colliders:extra_colliders,joints:moved_joints.len(),pairs:contacts.len(),..Resources::default()};
     for pair in &contacts {extra.manifolds+=pair.manifolds.len();extra.points+=pair.manifolds.iter().map(|m|m.points.len()+m.data.solver_contacts.len()).sum::<usize>();}
     peak.add(extra);peak.bounded()?;
-    let mut source_sim=source.sim.staged_clone();let mut destination_sim=destination.sim.staged_clone();
     let mut source_bodies=source.bodies.clone();let mut destination_bodies=destination.bodies.clone();
     let mut source_epochs=source.body_epochs.clone();let mut destination_epochs=destination.body_epochs.clone();
+    let mut source_history=source.body_history.clone();let mut destination_history=destination.body_history.clone();
     let mut source_joints=source.joints.clone();let mut destination_joints=destination.joints.clone();
     for stable in ids {
         let old=source.bodies[stable];let original=&source.sim.rigid_body_set[old];
         let new=destination_sim.rigid_body_set.insert(original.clone()); body_remap.insert(old,new);
         for collider in original.colliders() {
             let new_collider=destination_sim.collider_set.planetary_import_collider(&source.sim.collider_set[*collider],new,&mut destination_sim.rigid_body_set,delta);
-            destination_sim.broad_phase.planetary_import_leaf(&source.sim.broad_phase,*collider,new_collider,delta);
+            destination_sim.broad_phase.planetary_import_leaf(&source_sim.broad_phase,*collider,new_collider,delta);
             collider_remap.insert(*collider,new_collider);
         }
         destination_sim.rigid_body_set.planetary_restore_imported_body(new,original,delta);
         destination_bodies.insert(*stable,new);source_bodies.remove(stable);
         destination_epochs.insert(*stable,source_epochs.remove(stable).ok_or("missing source ownership epoch")?.checked_add(1).ok_or("ownership epoch exhausted")?);
+        destination_history.insert(*stable,source_history.remove(stable).ok_or("missing native body history")?);
     }
     let island_remap:Vec<_>=selected.iter().map(|old|(*old,body_remap[old])).collect();
-    destination_sim.island_manager.planetary_import_islands(&source.sim.island_manager,&mut destination_sim.rigid_body_set,&island_remap);
+    destination_sim.island_manager.planetary_import_islands(&source_sim.island_manager,&mut destination_sim.rigid_body_set,&island_remap);
     for (stable,original) in &moved_joints {
         let joint=destination_sim.impulse_joint_set.insert(body_remap[&original.body1],body_remap[&original.body2],original.data,false);
         destination_sim.impulse_joint_set.get_mut(joint,false).unwrap().impulses=original.impulses;
@@ -266,23 +290,90 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result
         }
         destination_sim.narrow_phase.planetary_import_contact(&destination_sim.collider_set,pair);
     }
+    let moved_contacts=contacts.len();drop(contacts);
     for handle in selected {
         source_sim.rigid_body_set.remove(handle,&mut source_sim.island_manager,&mut source_sim.collider_set,
             &mut source_sim.impulse_joint_set,&mut source_sim.multibody_joint_set,true).ok_or("staged source body absent")?;
     }
+    source_sim.flush_pending_removals();
     source_sim.validate_bounds(Vec3::ZERO)?;destination_sim.validate_bounds(Vec3::ZERO)?;
     let mut resources=Resources::scene(&source_sim);resources.add(Resources::scene(&destination_sim));
     let mut total=live;total.add(resources);total.bounded()?;
     Ok(PreparedTransfer {id,source:source_id,destination:destination_id,source_mutation:source.mutation,
         destination_mutation:destination.mutation,source_epoch:source.epoch,destination_epoch:destination.epoch,
-        time_nanos:source.time_nanos,source_sim,destination_sim,source_bodies,destination_bodies,
-        source_epochs,destination_epochs,source_joints,destination_joints,resources,
-        moved_bodies:count,moved_joints:moved_joints.len(),moved_contacts:contacts.len()})
+        time_nanos:source.time_nanos,destination_time_nanos:destination.time_nanos,source_sim,destination_sim,source_bodies,destination_bodies,
+        source_epochs,destination_epochs,source_history,destination_history,source_joints,destination_joints,resources,
+        moved_bodies:count,moved_joints:moved_joints.len(),moved_contacts,mapping:None})
 }
 
 fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->Result<Vec<i64>,String> {
+    if mapping_retains(registry,scene)&&!matches!(op,0|3|7|8|11|13|20|22|30|35|40|42|44|49|50|52|53|54|56){return Err("mapped transfer receipt retains scene mutations".into());}
     if matches!(op,1|2|14){controlled::transfer_ready(registry,scene,scene)?;}
     match op {
+        50 => {if !ids.is_empty(){return Err("mapped transfer capability takes no identities".into());}require(values,0)?;Ok(vec![4,1,4096,128])},
+        51 => {
+            if registry.transfer.is_some()||registry.mapped_receipt.is_some(){return Err("mapped transfer staging/receipt capacity exhausted".into());}
+            if ids.len()<10{return Err("incomplete two-clock transfer descriptor".into());}
+            let source=lookup(registry,scene)?;let destination=lookup(registry,ids[0])?;
+            if [source.epoch,destination.epoch,source.time_nanos,destination.time_nanos,source.mutation,destination.mutation]!=ids[1..7]{return Err("stale source/destination clock domain".into());}
+            source.mutation.checked_add(1).ok_or("source mutation exhausted")?;destination.mutation.checked_add(1).ok_or("destination mutation exhausted")?;
+            let count=usize::try_from(ids[7]).map_err(|_|"invalid mapped body count")?;
+            if count>4096||ids.len()<10+count{return Err("mapped body count/descriptor bound".into());}
+            let links=usize::try_from(ids[8+count]).map_err(|_|"invalid mapped link count")?;
+            if links>4096{return Err("mapped collision link cap".into());}
+            let legacy_at=9+count+links*4;
+            if ids.len()<=legacy_at{return Err("missing legacy mapping count".into());}
+            let legacy_count=usize::try_from(ids[legacy_at]).map_err(|_|"invalid mapped legacy count")?;
+            if legacy_count>128||ids.len()!=legacy_at+1+legacy_count*5||count+legacy_count==0{return Err("mapped participant descriptor/cap".into());}
+            let legacy=character::prepare_mapped(registry,scene,ids[0],&ids[legacy_at+1..])?;
+            let mut ordinary=vec![ids[0],ids[1],ids[2],ids[7]];ordinary.extend_from_slice(&ids[8..legacy_at]);
+            let id=registry.next_transfer.checked_add(1).ok_or("transition identity exhausted")?;
+            let mut prepared=prepare(registry,scene,&ordinary,values,id,true)?;
+            let mut body_ids=ids[8..8+count].to_vec();body_ids.sort_unstable();
+            let selected:HashSet<_>=body_ids.iter().copied().collect();let controlled=controlled::mapped_actor_words(&registry.controlled,scene,&selected);
+            let delta=destination.time_nanos.checked_sub(source.time_nanos).ok_or("clock domain delta overflow")?;
+            let mut receipt=vec![4,id,scene,ids[0],source.epoch,destination.epoch,source.time_nanos,destination.time_nanos,
+                source.mutation,destination.mutation,delta,count as i64,prepared.moved_joints as i64,prepared.moved_contacts as i64,legacy_count as i64,(controlled.len()/5) as i64];
+            for body in body_ids {
+                let old=source.bodies[&body].into_raw_parts();let new=prepared.destination_bodies[&body].into_raw_parts();
+                receipt.extend([body,source.body_epochs[&body],prepared.destination_epochs[&body],old.0 as i64,old.1 as i64,new.0 as i64,new.1 as i64]);
+                receipt.extend(source.body_history.get(&body).ok_or("missing mapped body history")?.words());
+            }
+            let mut joints:Vec<_>=source.joints.keys().filter(|id|!prepared.source_joints.contains_key(id)).copied().collect();joints.sort_unstable();
+            for joint in joints{
+                let old=source.joints[&joint];let old_parts=old.into_raw_parts();let new=prepared.destination_joints[&joint].into_raw_parts();let data=source.sim.impulse_joint_set.get(old).ok_or("missing mapped joint")?;
+                let a=*source.bodies.iter().find(|(_,h)|**h==data.body1).ok_or("unowned mapped joint endpoint")?.0;
+                let b=*source.bodies.iter().find(|(_,h)|**h==data.body2).ok_or("unowned mapped joint endpoint")?.0;
+                receipt.extend([joint,a,b,old_parts.0 as i64,old_parts.1 as i64,new.0 as i64,new.1 as i64]);
+            }
+            receipt.extend(controlled);receipt.extend(character::mapped_words(&legacy));
+            prepared.mapping=Some(MappedPreparation{receipt:receipt.clone(),legacy});registry.transfer=Some(prepared);registry.next_transfer=id;Ok(receipt)
+        },
+        52 => {
+            if ids.len()!=1{return Err("mapped commit requires exact transition".into());}require(values,0)?;
+            if let Some(done)=&registry.mapped_receipt{if done.id==ids[0]&&done.source==scene{return Ok(done.receipt.clone());}return Err("another mapped receipt remains owned".into());}
+            let t=registry.transfer.as_ref().ok_or("unknown mapped transfer")?;
+            if t.id!=ids[0]||t.source!=scene{return Err("stale mapped transition".into());}let mapping=t.mapping.as_ref().ok_or("legacy transfer is not API4")?;
+            let source=lookup(registry,t.source)?;let destination=lookup(registry,t.destination)?;
+            if source.epoch!=t.source_epoch||destination.epoch!=t.destination_epoch||source.mutation!=t.source_mutation||destination.mutation!=t.destination_mutation
+                ||source.time_nanos!=t.time_nanos||destination.time_nanos!=t.destination_time_nanos{return Err("mapped preparation changed before commit".into());}
+            controlled::transfer_ready(registry,t.source,t.destination)?;character::validate_mapped(&registry.characters,&mapping.legacy)?;
+            if character::pending_in_scene(&registry.characters,t.source)!=0||character::pending_in_scene(&registry.characters,t.destination)!=0{return Err("legacy witness retains mapped transfer".into());}
+            let mut t=registry.transfer.take().unwrap();let mapping=t.mapping.take().unwrap();
+            let source=registry.scenes.get_mut(&t.source).unwrap();source.sim=t.source_sim;source.bodies=t.source_bodies;source.body_epochs=t.source_epochs;source.body_history=t.source_history;source.joints=t.source_joints;source.mutation+=1;
+            let destination=registry.scenes.get_mut(&t.destination).unwrap();destination.sim=t.destination_sim;destination.bodies=t.destination_bodies;destination.body_epochs=t.destination_epochs;destination.body_history=t.destination_history;destination.joints=t.destination_joints;destination.mutation+=1;
+            controlled::transferred(registry,t.source,t.destination);character::commit_mapped(&mut registry.characters,mapping.legacy);
+            registry.mapped_receipt=Some(RetainedMapping{id:t.id,source:t.source,destination:t.destination,receipt:mapping.receipt});Ok(registry.mapped_receipt.as_ref().unwrap().receipt.clone())
+        },
+        53 => {if ids.len()!=1{return Err("mapped lookup requires exact transition".into());}require(values,0)?;
+            Ok(registry.mapped_receipt.as_ref().filter(|r|r.id==ids[0]&&r.source==scene).map(|r|r.receipt.clone()).unwrap_or_default())},
+        54 => {if ids.len()!=1{return Err("mapped ACK requires exact transition".into());}require(values,0)?;
+            if !registry.mapped_receipt.as_ref().is_some_and(|r|r.id==ids[0]&&r.source==scene){return Err("stale mapped ACK".into());}registry.mapped_receipt=None;Ok(vec![ids[0]])},
+        55 => {if ids.len()!=1{return Err("mapped abort requires exact transition".into());}require(values,0)?;
+            if registry.mapped_receipt.is_some(){return Err("committed mapped ownership cannot abort".into());}
+            if !registry.transfer.as_ref().is_some_and(|r|r.id==ids[0]&&r.source==scene&&r.mapping.is_some()){return Err("stale mapped abort".into());}registry.transfer=None;Ok(vec![ids[0]])},
+        56 => {if ids.len()!=5{return Err("native history query requires exact body ownership lease".into());}require(values,0)?;
+            let region=lookup(registry,scene)?;body_lease(region,ids)?;Ok(region.body_history.get(&ids[0]).ok_or("unknown native body history")?.words().to_vec())},
         0 => {
             if ids.len()!=1 {return Err("body identity requires one ID".into());}
             let region=lookup(registry,scene)?;let handle=*region.bodies.get(&ids[0]).ok_or("unknown body")?;
@@ -316,9 +407,9 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
             let (slot,generation)=handle.into_raw_parts();Ok(vec![ids[0],*first,*second,slot as i64,generation as i64])
         },
         4 => {
-            if registry.transfer.is_some(){return Err("transfer staging capacity exhausted".into());}
+            if registry.transfer.is_some()||registry.mapped_receipt.is_some(){return Err("transfer staging/receipt capacity exhausted".into());}
             let id=registry.next_transfer.checked_add(1).ok_or("transition identity exhausted")?;
-            let prepared=prepare(registry,scene,ids,values,id)?;
+            let prepared=prepare(registry,scene,ids,values,id,false)?;
             let receipt=vec![id,prepared.source_mutation,prepared.destination_mutation,prepared.time_nanos,
                 prepared.moved_bodies as i64,prepared.moved_joints as i64,prepared.moved_contacts as i64];
             registry.transfer=Some(prepared);registry.next_transfer=id;Ok(receipt)
@@ -327,18 +418,21 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
             if ids.len()!=1{return Err("commit requires transition ID".into());}
             let transfer=registry.transfer.as_ref().ok_or("unknown transfer")?;
             if transfer.id!=ids[0]||transfer.source!=scene{return Err("stale transition identity".into());}
+            if transfer.mapping.is_some(){return Err("mapped transfer requires API4 commit".into());}
             let source=lookup(registry,transfer.source)?;let destination=lookup(registry,transfer.destination)?;
             if source.mutation!=transfer.source_mutation || destination.mutation!=transfer.destination_mutation
                 || source.epoch!=transfer.source_epoch || destination.epoch!=transfer.destination_epoch
-                || source.time_nanos!=transfer.time_nanos || destination.time_nanos!=transfer.time_nanos {
+                || source.time_nanos!=transfer.time_nanos || destination.time_nanos!=transfer.destination_time_nanos {
                 return Err("transfer preparation became stale; abort and retry".into());
             }
             let transfer=registry.transfer.take().unwrap();
             let source=registry.scenes.get_mut(&transfer.source).unwrap();
             source.sim=transfer.source_sim;source.bodies=transfer.source_bodies;source.body_epochs=transfer.source_epochs;
+            source.body_history=transfer.source_history;
             source.joints=transfer.source_joints;source.mutation+=1;
             let destination=registry.scenes.get_mut(&transfer.destination).unwrap();
             destination.sim=transfer.destination_sim;destination.bodies=transfer.destination_bodies;destination.body_epochs=transfer.destination_epochs;
+            destination.body_history=transfer.destination_history;
             destination.joints=transfer.destination_joints;destination.mutation+=1;
             controlled::transferred(registry,transfer.source,transfer.destination);
             Ok(vec![transfer.id,transfer.time_nanos,transfer.moved_bodies as i64])
@@ -346,6 +440,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
         6 => {
             if ids.len()!=1{return Err("abort requires transition ID".into());}
             if !registry.transfer.as_ref().is_some_and(|t|t.id==ids[0]&&t.source==scene){return Err("stale transition identity".into());}
+            if registry.transfer.as_ref().unwrap().mapping.is_some(){return Err("mapped transfer requires API4 abort".into());}
             registry.transfer=None;Ok(vec![])
         },
         7 => Ok(registry.transfer.as_ref().map(|t|t.resources.values()).unwrap_or_else(||Resources::default().values())),

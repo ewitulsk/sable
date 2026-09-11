@@ -183,10 +183,28 @@ diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
 diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
 --- a/src/geometry/broad_phase_bvh.rs
 +++ b/src/geometry/broad_phase_bvh.rs
-@@ -53,6 +53,35 @@ pub enum BvhOptimizationStrategy {
+@@ -53,6 +53,53 @@ pub enum BvhOptimizationStrategy {
  const ENABLE_TREE_VALIDITY_CHECK: bool = false;
  
  impl BroadPhaseBvh {
++    /// Consume only exact retired collider identities before a transfer reuses arena slots.
++    /// Keep live padded leaves/pairs and the frame clock; this is not a simulation step.
++    pub fn planetary_remove_colliders(&mut self, params: &IntegrationParameters, bodies: &RigidBodySet, colliders: &ColliderSet, removed: &[ColliderHandle]) {
++        let retired: HashMap<_, _> = removed.iter().map(|handle| (*handle, ())).collect();
++        for handle in removed {
++            assert!(colliders.get(*handle).is_none(), "retired collider is still live");
++            let index = handle.into_raw_parts().0;
++            self.tree.remove(index);
++            // Ordinary terrain replacement may already have reused this index. Its current
++            // generation is distinct; preserve its actual shape instead of leaving a hole.
++            if let Some((collider, current)) = colliders.get_unknown_gen(index) {
++                if collider.is_enabled() {
++                    self.set_aabb(params, current, collider.compute_broad_phase_aabb(params, bodies));
++                }
++            }
++        }
++        self.pairs.retain(|(first, second), _| !retired.contains_key(first) && !retired.contains_key(second));
++    }
 +    /// Build broad-phase leaves for an actor-free scene without advancing its simulation clock.
 +    pub fn planetary_initialize_static(&mut self, params: &IntegrationParameters, bodies: &RigidBodySet, colliders: &ColliderSet) {
 +        for (handle, collider) in colliders.iter() {

@@ -11,7 +11,9 @@ const MAX_CANDIDATES:usize=64;
 const MAX_PRIMITIVES:usize=16384;
 const MAX_CONTACTS:usize=64;
 const SKIN:f64=0.00001;
-struct Actor {lease:i64,scene:i64,half:Vec3,mass:f64,last_sequence:i64,last_time:i64,next_time:i64,pending:Option<i64>}
+#[derive(Clone,PartialEq)]
+struct Actor {lease:i64,scene:i64,half:Vec3,mass:f64,last_sequence:i64,last_time:i64,next_time:i64,
+    history_domain:i64,history_duration:i64,pending:Option<i64>}
 struct Reaction {id:i64,lease:[i64;5],handle:RigidBodyHandle,after:RigidBody}
 struct Witness {actor:i64,lease:i64,scene:i64,epoch:i64,time:i64,end_time:i64,mutation:i64,sequence:i64,reactions:Vec<Reaction>}
 #[derive(Default)]
@@ -20,6 +22,28 @@ pub(super) fn count(state:&State)->usize{state.actors.len()}
 pub(super) fn contains(state:&State,id:i64)->bool{state.actors.contains_key(&id)}
 pub(super) fn owns_scene(state:&State,scene:i64)->bool{state.actors.values().any(|a|a.scene==scene)}
 pub(super) fn pending_in_scene(state:&State,scene:i64)->usize{state.witnesses.values().filter(|w|w.scene==scene).count()}
+pub(super) struct MappedActor {id:i64,before:Actor,after:Actor}
+pub(super) fn prepare_mapped(registry:&Registry,source:i64,destination:i64,descriptors:&[i64])->Result<Vec<MappedActor>,String>{
+    if descriptors.len()%5!=0||descriptors.len()/5>MAX_ACTORS{return Err("legacy clock mapping capacity".into());}
+    if pending_in_scene(&registry.characters,source)!=0||pending_in_scene(&registry.characters,destination)!=0{return Err("legacy witness retains clock mapping".into());}
+    if !descriptors.is_empty()&&controlled::owns_scene(&registry.controlled,destination){return Err("legacy/controlled mode mixing at mapped destination".into());}
+    let source_now=transfer::lookup(registry,source)?.time_nanos;let destination_now=transfer::lookup(registry,destination)?.time_nanos;
+    let mut selected=HashSet::new();let mut result=Vec::new();
+    for d in descriptors.chunks_exact(5){
+        let before=registry.characters.actors.get(&d[0]).ok_or("unknown mapped legacy actor")?;
+        if !selected.insert(d[0])||before.scene!=source||before.pending.is_some()||[before.lease,before.last_sequence,before.last_time,before.next_time]!=d[1..5]{return Err("stale mapped legacy actor lease/history".into());}
+        let mut after=before.clone();after.scene=destination;after.next_time=time::map_eligibility(source_now,destination_now,before.next_time)?;
+        result.push(MappedActor{id:d[0],before:before.clone(),after});
+    }
+    result.sort_by_key(|a|a.id);Ok(result)
+}
+pub(super) fn validate_mapped(state:&State,actors:&[MappedActor])->Result<(),String>{
+    for a in actors{if state.actors.get(&a.id)!=Some(&a.before){return Err("mapped legacy actor changed after preparation".into());}}Ok(())
+}
+pub(super) fn mapped_words(actors:&[MappedActor])->Vec<i64>{
+    actors.iter().flat_map(|a|[a.id,a.before.lease,a.before.last_sequence,a.before.history_domain,a.before.last_time,a.before.history_duration,a.before.next_time,a.after.next_time]).collect()
+}
+pub(super) fn commit_mapped(state:&mut State,actors:Vec<MappedActor>){for a in actors{state.actors.insert(a.id,a.after);}}
 pub(super) fn retire_scene(state:&mut State,scene:i64){state.actors.retain(|_,a|a.scene!=scene);state.witnesses.retain(|_,w|w.scene!=scene);}
 fn identity(region:&Region,id:i64,actor:&Actor)->Vec<i64>{vec![id,actor.lease,actor.scene,region.epoch,actor.last_sequence,actor.last_time,actor.next_time]}
 fn actor<'a>(registry:&'a Registry,scene:i64,ids:&[i64])->Result<&'a Actor,String>{
@@ -118,7 +142,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
             transfer::lookup(registry,scene)?;
             if registry.characters.actors.len()+controlled::count(&registry.controlled)>=MAX_ACTORS||registry.characters.actors.contains_key(&ids[0])||(controlled::contains(&registry.controlled,ids[0])||controlled::owns_scene(&registry.controlled,scene)){return Err("character registration capacity or duplicate identity".into());}
             let lease=registry.characters.next_lease.checked_add(1).ok_or("character registration identity exhausted")?;
-            let a=Actor{lease,scene,half,mass:values[3],last_sequence:0,last_time:-1,next_time:0,pending:None};let result=identity(&registry.scenes[&scene],ids[0],&a);
+            let a=Actor{lease,scene,half,mass:values[3],last_sequence:0,last_time:-1,next_time:0,history_domain:scene,history_duration:0,pending:None};let result=identity(&registry.scenes[&scene],ids[0],&a);
             registry.characters.actors.insert(ids[0],a);registry.characters.next_lease=lease;Ok(result)
         },
         22=>{if ids.len()!=1{return Err("character identity needs actor ID".into());}require(values,0)?;let a=registry.characters.actors.get(&ids[0]).ok_or("unknown character")?;if a.scene!=scene{return Err("foreign character scene".into());}Ok(identity(transfer::lookup(registry,scene)?,ids[0],a))},
@@ -143,7 +167,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
             let region=registry.scenes.get_mut(&scene).unwrap();
             for r in w.reactions{region.sim.rigid_body_set.get_mut(r.handle).unwrap();region.sim.rigid_body_set.planetary_restore_imported_body(r.handle,&r.after,Vec3::ZERO);}
             region.mutation=mutation;
-            let a=registry.characters.actors.get_mut(&w.actor).unwrap();a.pending=None;a.last_sequence=w.sequence;a.last_time=w.time;a.next_time=w.end_time;
+            let a=registry.characters.actors.get_mut(&w.actor).unwrap();a.pending=None;a.last_sequence=w.sequence;a.last_time=w.time;a.next_time=w.end_time;a.history_domain=w.scene;a.history_duration=w.end_time-w.time;
             Ok(vec![ids[0],w.sequence,w.time,w.end_time,count as i64])
         },
         26=>{if ids.len()!=3{return Err("abort needs witness, actor and registration identity".into());}require(values,0)?;let w=registry.characters.witnesses.get(&ids[0]).ok_or("retired character witness")?;if w.scene!=scene||w.actor!=ids[1]||w.lease!=ids[2]{return Err("foreign character witness".into());}registry.characters.witnesses.remove(&ids[0]);registry.characters.actors.get_mut(&ids[1]).unwrap().pending=None;Ok(vec![])},

@@ -58,6 +58,22 @@ pub(super) fn owns_body(state: &State, scene: i64, id: i64) -> bool {
 pub(super) fn owns_scene(state: &State, scene: i64) -> bool {
     state.actors.values().any(|a| a.scene == scene)
 }
+pub(super) fn mapped_actor_words(
+    state: &State,
+    scene: i64,
+    bodies: &std::collections::HashSet<i64>,
+) -> Vec<i64> {
+    let mut selected: Vec<_> = state
+        .actors
+        .values()
+        .filter(|a| a.scene == scene && bodies.contains(&a.body))
+        .collect();
+    selected.sort_by_key(|a| a.id);
+    selected
+        .into_iter()
+        .flat_map(|a| [a.id, a.kind, a.lease, a.last_sequence, a.body])
+        .collect()
+}
 pub(super) fn retire_scene(state: &mut State, scene: i64) {
     state.actors.retain(|_, a| a.scene != scene);
 }
@@ -473,6 +489,9 @@ pub(super) fn dispatch(
                 .recompute_mass_properties_from_colliders(&region.sim.collider_set);
             region.bodies.insert(key, h);
             region.body_epochs.insert(key, 0);
+            region
+                .body_history
+                .insert(key, time::BodyHistory::allocated(scene, region.time_nanos));
             region.mutation += 1;
             let a = Actor {
                 id: ids[0],
@@ -595,6 +614,7 @@ pub(super) fn dispatch(
                 .ok_or("controlled body absent")?;
             region.bodies.remove(&key);
             region.body_epochs.remove(&key);
+            region.body_history.remove(&key);
             region.mutation += 1;
             registry.controlled.actors.remove(&ids[0]);
             Ok(vec![])
