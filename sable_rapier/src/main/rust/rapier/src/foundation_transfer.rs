@@ -135,6 +135,7 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result
     require(v,3)?; let delta=vec(v,0)?;
     if args.len()<5 { return Err("incomplete transfer descriptor".into()); }
     let destination_id=args[0];
+    controlled::transfer_ready(registry,source_id,destination_id)?;
     if source_id==destination_id { return Err("transfer requires distinct scenes".into()); }
     let source=lookup(registry,source_id)?; let destination=lookup(registry,destination_id)?;
     if source.epoch!=args[1] || destination.epoch!=args[2] { return Err("stale transfer frame".into()); }
@@ -280,6 +281,7 @@ fn prepare(registry:&Registry,source_id:i64,args:&[i64],v:&[f64],id:i64)->Result
 }
 
 fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->Result<Vec<i64>,String> {
+    if matches!(op,1|2|14){controlled::transfer_ready(registry,scene,scene)?;}
     match op {
         0 => {
             if ids.len()!=1 {return Err("body identity requires one ID".into());}
@@ -289,6 +291,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
         },
         1 => {
             if ids.len()!=3||ids[0]<=0 {return Err("joint requires stable ID and two body IDs".into());} require(values,6)?;
+            if controlled::owns_body(&registry.controlled,scene,ids[1])||controlled::owns_body(&registry.controlled,scene,ids[2]){return Err("controlled actors cannot acquire undeclared constraints".into());}
             let a=vec(values,0)?;let b=vec(values,3)?;
             let region=registry.scenes.get_mut(&scene).ok_or("stale scene")?;
             if region.joints.contains_key(&ids[0]) || region.sim.impulse_joint_set.len()>=4096 {return Err("joint identity or capacity conflict".into());}
@@ -337,6 +340,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
             let destination=registry.scenes.get_mut(&transfer.destination).unwrap();
             destination.sim=transfer.destination_sim;destination.bodies=transfer.destination_bodies;destination.body_epochs=transfer.destination_epochs;
             destination.joints=transfer.destination_joints;destination.mutation+=1;
+            controlled::transferred(registry,transfer.source,transfer.destination);
             Ok(vec![transfer.id,transfer.time_nanos,transfer.moved_bodies as i64])
         },
         6 => {
@@ -352,6 +356,8 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
         },
         9 | 10 => {
             if ids.len()!=5 {return Err("motion update requires complete body/frame lease".into());}
+            if controlled::owns_body(&registry.controlled,scene,ids[0]){return Err("controlled actor motion requires queued controlled input".into());}
+            controlled::transfer_ready(registry,scene,scene)?;
             require(values,if op==9{13}else{7})?;let target=pose(values)?;
             let linear=if op==9{vec(values,7)?}else{Vec3::ZERO};let angular=if op==9{vec(values,10)?}else{Vec3::ZERO};
             let region=registry.scenes.get_mut(&scene).ok_or("stale scene")?;
@@ -370,6 +376,8 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
         11 => {require(values,0)?;Ok(vec![3])},
         12 => {
             if ids.len()!=5{return Err("body properties require complete body/frame lease".into());}require(values,12)?;
+            if controlled::owns_body(&registry.controlled,scene,ids[0]){return Err("controlled actor properties require its owner API".into());}
+            controlled::transfer_ready(registry,scene,scene)?;
             if values.iter().any(|v|!v.is_finite())||values[0]<=0.||values[0]>1e9
                 ||values[1]<0.||values[1]>100.||values[2]<0.||values[2]>100.
                 ||!(values[3]==0.||values[3]==1.)||values[4]<0.||values[4]>16.
@@ -415,7 +423,8 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
             Ok(vec![scene,region.epoch,region.time_nanos,region.mutation])
         },
         20..=27 => character::dispatch(registry,scene,op,ids,values),
-        30..=34 => terrain_batch::dispatch(registry,scene,op,ids,values),
+        30..=35 => {controlled::transfer_ready(registry,scene,scene)?;terrain_batch::dispatch(registry,scene,op,ids,values)},
+        40..=48 => controlled::dispatch(registry,scene,op,ids,values),
         _=>Err("unknown typed foundation operation".into()),
     }
 }

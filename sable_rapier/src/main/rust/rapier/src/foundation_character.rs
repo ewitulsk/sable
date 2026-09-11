@@ -16,6 +16,8 @@ struct Reaction {id:i64,lease:[i64;5],handle:RigidBodyHandle,after:RigidBody}
 struct Witness {actor:i64,lease:i64,scene:i64,epoch:i64,time:i64,end_time:i64,mutation:i64,sequence:i64,reactions:Vec<Reaction>}
 #[derive(Default)]
 pub(super) struct State {next_lease:i64,next_witness:i64,actors:HashMap<i64,Actor>,witnesses:HashMap<i64,Witness>}
+pub(super) fn count(state:&State)->usize{state.actors.len()}
+pub(super) fn contains(state:&State,id:i64)->bool{state.actors.contains_key(&id)}
 pub(super) fn owns_scene(state:&State,scene:i64)->bool{state.actors.values().any(|a|a.scene==scene)}
 pub(super) fn retire_scene(state:&mut State,scene:i64){state.actors.retain(|_,a|a.scene!=scene);state.witnesses.retain(|_,w|w.scene!=scene);}
 fn identity(region:&Region,id:i64,actor:&Actor)->Vec<i64>{vec![id,actor.lease,actor.scene,region.epoch,actor.last_sequence,actor.last_time,actor.next_time]}
@@ -38,6 +40,7 @@ fn query_snapshot(region:&Region)->Result<(ColliderSet,Bvh),String>{
 }
 fn prepare(registry:&Registry,scene:i64,ids:&[i64],values:&[f64],witness_id:i64)->Result<(Witness,Vec<i64>),String>{
     if ids.len()!=8{return Err("character witness requires lease, scene clock, intent sequence and substep nanoseconds".into());}require(values,10)?;
+    if controlled::owns_scene(&registry.controlled,scene){return Err("legacy witnesses cannot mutate controlled solver participants".into());}
     let a=actor(registry,scene,ids)?;let region=transfer::lookup(registry,scene)?;
     if a.pending.is_some(){return Err("character already owns a pending witness".into());}
     if ids[4]!=region.time_nanos||ids[5]!=region.mutation{return Err("stale character query clock/mutation".into());}
@@ -112,7 +115,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
             if ids.len()!=1||ids[0]<=0{return Err("positive server-owned character ID required".into());}require(values,4)?;
             let half=vec(values,0)?;if half.min_element()<0.05||half.max_element()>2.||!values[3].is_finite()||values[3]<1.||values[3]>500.{return Err("invalid server-owned character shape/mass".into());}
             transfer::lookup(registry,scene)?;
-            if registry.characters.actors.len()>=MAX_ACTORS||registry.characters.actors.contains_key(&ids[0]){return Err("character registration capacity or duplicate identity".into());}
+            if registry.characters.actors.len()+controlled::count(&registry.controlled)>=MAX_ACTORS||registry.characters.actors.contains_key(&ids[0])||(controlled::contains(&registry.controlled,ids[0])||controlled::owns_scene(&registry.controlled,scene)){return Err("character registration capacity or duplicate identity".into());}
             let lease=registry.characters.next_lease.checked_add(1).ok_or("character registration identity exhausted")?;
             let a=Actor{lease,scene,half,mass:values[3],last_sequence:0,last_time:-1,next_time:0,pending:None};let result=identity(&registry.scenes[&scene],ids[0],&a);
             registry.characters.actors.insert(ids[0],a);registry.characters.next_lease=lease;Ok(result)

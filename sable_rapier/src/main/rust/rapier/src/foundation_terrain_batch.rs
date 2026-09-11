@@ -2,12 +2,62 @@
 use super::*;
 use std::collections::HashSet;
 const MAX_BATCH:usize=8;
+const MAX_BODY_CANDIDATES:usize=64;
+const MAX_CONTACT_PARTS:usize=16384;
+const PENETRATION_EPSILON:f64=0.00001;
 struct Receipt { request:Vec<i64>,values:Vec<u64>,result:Vec<i64> }
 #[derive(Default)]
 pub(super) struct State { high_water:i64,receipt:Option<Receipt> }
 
+fn primitive_key(pose:&Pose,shape:&SharedShape)->Result<[u64;10],String>{
+    let half=shape.as_cuboid().ok_or("terrain edit requires compiled box primitives")?.half_extents;
+    Ok([pose.translation.x.to_bits(),pose.translation.y.to_bits(),pose.translation.z.to_bits(),
+        pose.rotation.x.to_bits(),pose.rotation.y.to_bits(),pose.rotation.z.to_bits(),pose.rotation.w.to_bits(),
+        half.x.to_bits(),half.y.to_bits(),half.z.to_bits()])
+}
+// Inspect real current solver poses, including controlled actors. Only exact unchanged
+// primitives inherit an existing contact: an old floor's deeper penetration must not hide
+// a newly inserted wall. Changed primitives conservatively refuse current penetration.
+fn preflight_bodies(region:&Region,old:&Section,shape:&PreparedShape,position:Vec3,
+    candidates:&mut usize,parts:&mut usize)->Result<(),String>{
+    if old.fingerprint==shape.fingerprint&&old.translation==position{return Ok(());}
+    let Some(proposed)=&shape.shape else{return Ok(());};
+    if region.sim.collider_set.len()>8192{return Err("terrain edit collider enumeration cap".into());}
+    let pose=transfer::pose(&[position.x,position.y,position.z,0.,0.,0.,1.])?;
+    let bounds=proposed.compute_aabb(&pose);
+    for (_,collider) in region.sim.collider_set.iter(){
+        let Some(parent)=collider.parent() else{continue;};
+        let body=&region.sim.rigid_body_set[parent];
+        if !collider.is_enabled()||body.is_fixed(){continue;}
+        let current=*body.position()*collider.position_wrt_parent().ok_or("terrain edit collider lost parent transform")?;
+        if !bounds.intersects(&collider.shape().compute_aabb(&current)){continue;}
+        *candidates=candidates.checked_add(1).ok_or("terrain edit candidate overflow")?;
+        let actor_parts=collider.shape().as_compound().map_or(1,|c|c.shapes().len());
+        let work=shape.budget.0.checked_add(old._parts.0).and_then(|p|p.checked_mul(actor_parts)).ok_or("terrain edit contact work overflow")?;
+        *parts=parts.checked_add(work).ok_or("terrain edit contact work overflow")?;
+        if *candidates>MAX_BODY_CANDIDATES||*parts>MAX_CONTACT_PARTS{return Err("terrain edit body candidate/primitive cap".into());}
+        let mut unchanged=HashSet::new();
+        if let Some(handle)=old.collider{
+            let original=&region.sim.collider_set[handle];
+            let compound=original.shape().as_compound().ok_or("original terrain is not compiled compound geometry")?;
+            for (local,primitive) in compound.shapes(){unchanged.insert(primitive_key(&(*original.position()*local),primitive)?);}
+        }
+        let compound=proposed.as_compound().ok_or("candidate terrain is not compiled compound geometry")?;
+        for (local,primitive) in compound.shapes(){
+            let world_pose=pose*local;
+            if unchanged.contains(&primitive_key(&world_pose,primitive)?){continue;}
+            if let Some(contact)=rapier3d_f64::parry::query::contact(&world_pose,primitive.as_ref(),&current,collider.shape(),0.)
+                .map_err(|_|"unsupported terrain edit body shape")?{
+                if !contact.dist.is_finite()||contact.dist < -PENETRATION_EPSILON{return Err("changed terrain primitive penetrates a physical body".into());}
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->Result<Vec<i64>,String>{
     if op==30{if !ids.is_empty(){return Err("terrain batch capability takes no identities".into());}require(values,0)?;return Ok(vec![2,MAX_BATCH as i64]);}
+    if op==35{if !ids.is_empty(){return Err("body-aware terrain capability takes no identities".into());}require(values,0)?;return Ok(vec![1,MAX_BODY_CANDIDATES as i64,MAX_CONTACT_PARTS as i64]);}
     if op==32||op==33{
         if ids.len()!=1||ids[0]<=0{return Err("terrain batch action ID required".into());}require(values,0)?;
         let region=registry.scenes.get_mut(&scene).ok_or("stale terrain batch scene")?;
@@ -40,6 +90,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
     result.extend([scene,region.epoch,region.time_nanos,region.mutation,mutation,ids[4],count as i64]);
     let mut old_parts=0usize;let mut new_parts=0usize;
     let mut wake=HashSet::new();
+    let mut body_candidates=0usize;let mut contact_parts=0usize;
     for (i,entry) in ids[6..].chunks_exact(6).enumerate(){
         if !leases.insert(entry[0])||!geometries.insert(entry[5]){return Err("duplicate terrain lease or prepared geometry".into());}
         let old=region.sections.get(&entry[0]).ok_or("retired terrain batch lease")?;
@@ -48,6 +99,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
         if let Some(handle)=old.body{if !region.sim.rigid_body_set.get(handle).is_some_and(|b|b.is_fixed()&&b.colliders()==[old.collider.unwrap()]){return Err("terrain section is not an isolated fixed collider".into());}}
         let shape=prepared.shapes.get(&entry[5]).ok_or("retired prepared geometry")?;
         let position=vec(values,i*3)?;bounded(position+Vec3::splat(16.))?;
+        preflight_bodies(region,old,shape,position,&mut body_candidates,&mut contact_parts)?;
         if old.fingerprint!=shape.fingerprint||old.translation!=position{
             if let Some(collider)=old.collider{for pair in region.sim.narrow_phase.contact_pairs_with(collider){
                 let other=if pair.collider1==collider{pair.collider2}else{pair.collider1};

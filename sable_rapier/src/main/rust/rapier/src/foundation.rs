@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod transfer;
 #[path = "foundation_character.rs"]
 mod character;
+#[path = "foundation_controlled.rs"]
+mod controlled;
 #[path = "foundation_terrain_batch.rs"]
 mod terrain_batch;
 
@@ -152,6 +154,7 @@ struct Registry {
     next_transfer: i64,
     transfer: Option<transfer::PreparedTransfer>,
     characters: character::State,
+    controlled: controlled::State,
 }
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 fn bounded(v: Vec3) -> Result<Vec3, String> {
@@ -350,38 +353,40 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 return Ok(vec![id as f64, 1.0]);
             }
             if op == 10 {
+                if controlled::owns_scene(&registry.controlled,handle){return Err("controlled participants retain scene until explicit retirement".into());}
                 transfer::retire_scene(&mut registry,handle);
                 character::retire_scene(&mut registry.characters,handle);
+                controlled::retire_scene(&mut registry.controlled,handle);
                 registry
                     .scenes
                     .remove(&handle)
                     .ok_or("stale scene handle")?;
                 return Ok(vec![]);
             }
+            if op == 4 {
+                require(&v,1)?;
+                if !v[0].is_finite()||v[0]<=0.||v[0]>0.05{return Err("invalid step".into());}
+                let elapsed_nanos=(v[0]*1_000_000_000.).round() as i64;
+                if elapsed_nanos<=0{return Err("step below native clock precision".into());}
+                let current=transfer::lookup(&registry,handle)?;
+                let next_time=current.time_nanos.checked_add(elapsed_nanos).ok_or("simulation clock exhausted")?;
+                let next_mutation=current.mutation.checked_add(1).ok_or("scene mutation exhausted")?;
+                controlled::before_step(&mut registry,handle,elapsed_nanos)?;
+                let region=registry.scenes.get_mut(&handle).unwrap();
+                region.sim.step(v[0]);region.time_nanos=next_time;region.mutation=next_mutation;
+                if let Err(error)=region.sim.validate_bounds(Vec3::ZERO){region.failed_range=true;return Err(error);}
+                if let Err(error)=controlled::after_step(&mut registry,handle){registry.scenes.get_mut(&handle).unwrap().failed_range=true;return Err(error);}
+                return Ok(vec![]);
+            }
+            if !matches!(op,5|7|13|16|18|22|23|24|25|26){controlled::transfer_ready(&registry,handle,handle)?;}
+            if controlled::owns_body(&registry.controlled,handle,key)&&matches!(op,3|8|9|11|12|17|22|23|24){return Err("controlled body mutation requires controlled actor owner API".into());}
+            if op==8&&controlled::owns_body(&registry.controlled,handle,revision){return Err("controlled actor constraints require dedicated topology ownership".into());}
             let region = registry
                 .scenes
                 .get_mut(&handle)
                 .ok_or("stale scene handle")?;
             if region.failed_range && op != 5 && op != 13 && op != 18 {
                 return Err("scene escaped local bounds; inspect and retire it".into());
-            }
-            if op == 4 {
-                require(&v, 1)?;
-                if !v[0].is_finite() || v[0] <= 0. || v[0] > 0.05 {
-                    return Err("invalid step".into());
-                }
-                let elapsed_nanos=(v[0]*1_000_000_000.).round() as i64;
-                if elapsed_nanos<=0 {return Err("step is below native clock precision".into());}
-                let next_time=region.time_nanos.checked_add(elapsed_nanos).ok_or("simulation clock exhausted")?;
-                let next_mutation=region.mutation.checked_add(1).ok_or("scene mutation exhausted")?;
-                region.sim.step(v[0]);
-                region.time_nanos = next_time;
-                region.mutation = next_mutation;
-                if let Err(error) = region.sim.validate_bounds(Vec3::ZERO) {
-                    region.failed_range = true;
-                    return Err(error);
-                }
-                return Ok(vec![]);
             }
             let result = {
                 let sim = &mut region.sim;
