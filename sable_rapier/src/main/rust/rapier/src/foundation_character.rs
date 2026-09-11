@@ -19,6 +19,7 @@ pub(super) struct State {next_lease:i64,next_witness:i64,actors:HashMap<i64,Acto
 pub(super) fn count(state:&State)->usize{state.actors.len()}
 pub(super) fn contains(state:&State,id:i64)->bool{state.actors.contains_key(&id)}
 pub(super) fn owns_scene(state:&State,scene:i64)->bool{state.actors.values().any(|a|a.scene==scene)}
+pub(super) fn pending_in_scene(state:&State,scene:i64)->usize{state.witnesses.values().filter(|w|w.scene==scene).count()}
 pub(super) fn retire_scene(state:&mut State,scene:i64){state.actors.retain(|_,a|a.scene!=scene);state.witnesses.retain(|_,w|w.scene!=scene);}
 fn identity(region:&Region,id:i64,actor:&Actor)->Vec<i64>{vec![id,actor.lease,actor.scene,region.epoch,actor.last_sequence,actor.last_time,actor.next_time]}
 fn actor<'a>(registry:&'a Registry,scene:i64,ids:&[i64])->Result<&'a Actor,String>{

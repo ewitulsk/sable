@@ -656,6 +656,48 @@ pub(super) fn dispatch(
             registry.controlled.next_lease = lease;
             Ok(identity(region, a))
         }
+        49 => {
+            if !ids.is_empty() {
+                return Err("controlled quiescence takes no caller identities".into());
+            }
+            require(values, 0)?;
+            let region = transfer::lookup(registry, scene)?;
+            let mut actors: Vec<_> = registry
+                .controlled
+                .actors
+                .values()
+                .filter(|a| a.scene == scene)
+                .collect();
+            actors.sort_by_key(|a| a.id);
+            if actors.len() > MAX_PLAYERS + MAX_ITEMS {
+                return Err("controlled quiescence actor cap".into());
+            }
+            // Clock, membership, pending flags and full current states are captured under this
+            // one registry lock. A Java sequence of identity/state calls is not this receipt.
+            let mut result = vec![
+                1,
+                scene,
+                region.epoch,
+                region.time_nanos,
+                region.mutation,
+                actors.len() as i64,
+                character::pending_in_scene(&registry.characters, scene) as i64,
+            ];
+            for a in actors {
+                let state = transfer::body_state(region, a.body, region.body_epochs[&a.body])?;
+                if state.len() != 68 {
+                    return Err("controlled quiescence requires one owned box collider".into());
+                }
+                result.extend(identity(region, a));
+                result.extend([
+                    a.input.is_some() as i64,
+                    a.result.is_some() as i64,
+                    state.len() as i64,
+                ]);
+                result.extend(state.into_iter().map(bits));
+            }
+            Ok(result)
+        }
         _ => Err("unknown controlled actor operation".into()),
     }
 }

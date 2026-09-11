@@ -129,11 +129,16 @@ impl Simulation {
             },
         }
     }
-    fn step(&mut self, dt: f64) {
+    fn step(&mut self, dt: f64, controlled_participants: bool) {
         self.parameters.dt = dt;
+        // Resolve the complete contact patch before each small-step rotation integration.
+        // Extra island iterations alone still use one PGS sweep and can leave an asymmetric
+        // angular impulse on a centered actor impact. Ordinary actor-free scenes are unchanged.
+        let mut step_parameters = self.parameters;
+        if controlled_participants { step_parameters.num_internal_pgs_iterations = 4; }
         self.pipeline.step(
             self.gravity,
-            &self.parameters,
+            &step_parameters,
             &mut self.island_manager,
             &mut self.broad_phase,
             &mut self.narrow_phase,
@@ -372,8 +377,9 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                 let next_time=current.time_nanos.checked_add(elapsed_nanos).ok_or("simulation clock exhausted")?;
                 let next_mutation=current.mutation.checked_add(1).ok_or("scene mutation exhausted")?;
                 controlled::before_step(&mut registry,handle,elapsed_nanos)?;
+                let controlled_participants=controlled::owns_scene(&registry.controlled,handle);
                 let region=registry.scenes.get_mut(&handle).unwrap();
-                region.sim.step(v[0]);region.time_nanos=next_time;region.mutation=next_mutation;
+                region.sim.step(v[0],controlled_participants);region.time_nanos=next_time;region.mutation=next_mutation;
                 if let Err(error)=region.sim.validate_bounds(Vec3::ZERO){region.failed_range=true;return Err(error);}
                 if let Err(error)=controlled::after_step(&mut registry,handle){registry.scenes.get_mut(&handle).unwrap().failed_range=true;return Err(error);}
                 return Ok(vec![]);

@@ -424,7 +424,7 @@ fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values:&[f64])->R
         },
         20..=27 => character::dispatch(registry,scene,op,ids,values),
         30..=35 => {controlled::transfer_ready(registry,scene,scene)?;terrain_batch::dispatch(registry,scene,op,ids,values)},
-        40..=48 => controlled::dispatch(registry,scene,op,ids,values),
+        40..=49 => controlled::dispatch(registry,scene,op,ids,values),
         _=>Err("unknown typed foundation operation".into()),
     }
 }
