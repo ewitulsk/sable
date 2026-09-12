@@ -858,6 +858,11 @@ pub(super) fn dispatch(
             region.sim.collider_set.insert_with_parent(
                 ColliderBuilder::cuboid(half.x, half.y, half.z)
                     .mass(mass)
+                    // Solver contact separation prevents permitted micrometre floor overlap
+                    // from turning the next coplanar terrain section's edge into a wall.
+                    // This is real collision skin on every face, not ignored terrain contact;
+                    // it stays well inside the endpoint support query's 3mm reach.
+                    .contact_skin(0.0001)
                     .active_events(ActiveEvents::CONTACT_FORCE_EVENTS)
                     .contact_force_event_threshold(0.)
                     .friction(0.)
