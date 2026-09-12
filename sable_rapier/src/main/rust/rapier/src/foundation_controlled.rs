@@ -32,6 +32,7 @@ struct Input {
     final_receipt: Option<Vec<i64>>,
     // Actual force events from all CCD subdivisions; never endpoint support contacts.
     events: Vec<[i64; 16]>,
+    impacts: Vec<[i64; 17]>,
 }
 #[derive(Clone)]
 struct Actor {
@@ -57,7 +58,8 @@ pub(super) struct State {
 struct Peer { body: i64, epoch: i64, actor: i64, kind: i64, registration: i64 }
 struct EventBuffer {
     counts: HashMap<i64, usize>,
-    rows: Vec<(i64, [i64; 16])>,
+    rows: Vec<(i64, [i64; 17])>,
+    incoming: HashMap<(ColliderHandle,ColliderHandle,u32,u32),f64>,
     terminal_ineligible: std::collections::HashSet<i64>,
     failed: bool,
 }
@@ -72,7 +74,7 @@ impl StepEvents {
         let region = transfer::lookup(registry, scene)?;
         if !owns_scene(&registry.controlled, scene) {
             return Ok(Self { start: region.time_nanos, end, peers: HashMap::new(),
-                buffer: Mutex::new(EventBuffer { counts: HashMap::new(), rows: Vec::new(), terminal_ineligible: std::collections::HashSet::new(), failed: false }) });
+                buffer: Mutex::new(EventBuffer { counts: HashMap::new(), rows: Vec::new(), incoming: HashMap::new(), terminal_ineligible: std::collections::HashSet::new(), failed: false }) });
         }
         if region.bodies.len() > 4096 || region.sections.len() > MAX_SECTIONS {
             return Err("interval history body/terrain registry cap".into());
@@ -97,7 +99,7 @@ impl StepEvents {
             capacity += MAX_CONTACTS - input.events.len();
         }
         Ok(Self { start: region.time_nanos, end, peers,
-            buffer: Mutex::new(EventBuffer { counts, rows: Vec::with_capacity(capacity), terminal_ineligible: std::collections::HashSet::with_capacity(MAX_PLAYERS+MAX_ITEMS), failed: false }) })
+            buffer: Mutex::new(EventBuffer { counts, rows: Vec::with_capacity(capacity), incoming: HashMap::new(), terminal_ineligible: std::collections::HashSet::with_capacity(MAX_PLAYERS+MAX_ITEMS), failed: false }) })
     }
     pub(super) fn finish(self, registry: &mut Registry, scene: i64) -> Result<(), String> {
         let mut buffer = self.buffer.into_inner().map_err(|_|"interval contact collector poisoned")?;
@@ -107,7 +109,8 @@ impl StepEvents {
         for (id, event) in buffer.rows {
             let actor = registry.controlled.actors.get_mut(&id).ok_or("interval event actor vanished")?;
             if actor.scene != scene { return Err("interval event actor changed scene".into()); }
-            actor.input.as_mut().ok_or("interval event input vanished")?.events.push(event);
+            let input=actor.input.as_mut().ok_or("interval event input vanished")?;
+            input.events.push(event[..16].try_into().unwrap());input.impacts.push(event);
         }
         for id in buffer.terminal_ineligible {
             registry.controlled.actors.get_mut(&id).ok_or("terminal contact actor vanished")?
@@ -117,7 +120,25 @@ impl StepEvents {
         Ok(())
     }
 }
+// Read-only callback before the real solver, including each CCD subdivision. Only a
+// matching subsequent positive impulse promotes these samples into retained evidence.
 impl EventHandler for StepEvents {
+    fn handle_contact_pre_solve(&self,bodies:&RigidBodySet,colliders:&ColliderSet,pair:&ContactPair) {
+        let Ok(mut buffer)=self.buffer.lock() else{return;};if buffer.failed{return;}
+        let first=colliders.get(pair.collider1).and_then(|c|c.parent()).and_then(|h|bodies.get(h));
+        let second=colliders.get(pair.collider2).and_then(|c|c.parent()).and_then(|h|bodies.get(h));
+        for manifold in &pair.manifolds {
+            if manifold.data.solver_contacts.is_empty(){continue;}
+            let key=(pair.collider1,pair.collider2,manifold.subshape1,manifold.subshape2);
+            let speed=manifold.data.solver_contacts.iter().map(|contact| {
+                let a=first.map_or(Vec3::ZERO,|b|b.velocity_at_point(contact.point));
+                let b=second.map_or(Vec3::ZERO,|b|b.velocity_at_point(contact.point));
+                (a-b).dot(manifold.data.normal).max(0.)
+            }).fold(0.,f64::max);
+            if !speed.is_finite() || (!buffer.incoming.contains_key(&key) && buffer.incoming.len()>=(MAX_PLAYERS+MAX_ITEMS)*MAX_CONTACTS) {buffer.failed=true;return;}
+            buffer.incoming.insert(key,speed);
+        }
+    }
     fn handle_collision_event(&self, _: &RigidBodySet, _: &ColliderSet, _: CollisionEvent, _: Option<&ContactPair>) {}
     fn handle_contact_force_event(&self, dt: f64, _: &RigidBodySet, colliders: &ColliderSet,
                                   pair: &ContactPair, total_force: f64) {
@@ -144,6 +165,7 @@ impl EventHandler for StepEvents {
             let point = manifold.data.solver_contacts.iter().map(|p|p.point).sum::<Vec3>()
                 / manifold.data.solver_contacts.len() as f64;
             let normal = manifold.data.normal;
+            let Some(incoming)=buffer.incoming.get(&(pair.collider1,pair.collider2,manifold.subshape1,manifold.subshape2)).copied() else {buffer.failed=true;return;};
             if !point.is_finite() || !normal.is_finite() || (normal.length()-1.).abs()>1e-6 {
                 buffer.failed=true; return;
             }
@@ -160,7 +182,7 @@ impl EventHandler for StepEvents {
                 let (slot,generation)=collider.into_raw_parts();
                 buffer.rows.push((recipient.actor, [self.start,self.end,other.body,other.epoch,
                     slot as i64,generation as i64,other.actor,other.kind,other.registration,
-                    bits(point.x),bits(point.y),bits(point.z),bits(outward.x),bits(outward.y),bits(outward.z),bits(impulse)]));
+                    bits(point.x),bits(point.y),bits(point.z),bits(outward.x),bits(outward.y),bits(outward.z),bits(impulse),bits(incoming)]));
             }
         }
     }
@@ -590,7 +612,7 @@ pub(super) fn dispatch(
     ids: &[i64],
     values: &[f64],
 ) -> Result<Vec<i64>, String> {
-    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77 | 79 | 83) {
+    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77 | 79 | 83 | 84) {
         return Err("controlled actor mutation forbidden during transfer staging".into());
     }
     match op {
@@ -695,7 +717,7 @@ pub(super) fn dispatch(
             registry.controlled.actors.get_mut(&ids[0]).unwrap().input = Some(Input {
                 sequence: ids[7], start: ids[8], end: ids[9], velocity,
                 started: false, initial_velocity: velocity, segments, active_segment: 0,
-                applied_motor_delta: Vec3::ZERO, terminal: None, terminal_supported: true, post_rules: None, final_receipt: None, events: Vec::with_capacity(MAX_CONTACTS),
+                applied_motor_delta: Vec3::ZERO, terminal: None, terminal_supported: true, post_rules: None, final_receipt: None, events: Vec::with_capacity(MAX_CONTACTS), impacts: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])
         }
@@ -729,7 +751,7 @@ pub(super) fn dispatch(
             require(values,0)?;
             Ok(vec![1,MAX_CONTACTS as i64,(MAX_PLAYERS+MAX_ITEMS) as i64,16])
         }
-        58 => {
+        58 | 84 => {
             if ids.len()!=10 { return Err("interval contact history requires exact result receipt".into()); }
             require(values,0)?;
             let a=actor(registry,scene,ids)?;
@@ -737,7 +759,7 @@ pub(super) fn dispatch(
             if result[11..14]!=ids[7..10] { return Err("interval history result mismatch".into()); }
             let input=a.input.as_ref().ok_or("interval history input absent")?;
             let mut out=result[..14].to_vec();out.push(input.events.len() as i64);
-            for event in &input.events { out.extend(event); }
+            if op==84 {for event in &input.impacts {out.extend(event);}} else {for event in &input.events { out.extend(event); }}
             Ok(out)
         }
         40 => {
@@ -921,7 +943,7 @@ pub(super) fn dispatch(
                 terminal_supported: true,
                 post_rules: None,
                 final_receipt: None,
-                events: Vec::with_capacity(MAX_CONTACTS),
+                events: Vec::with_capacity(MAX_CONTACTS), impacts: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])
         }

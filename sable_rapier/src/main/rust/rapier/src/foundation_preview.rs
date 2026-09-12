@@ -16,6 +16,9 @@ pub(super) struct Preview {
     traces:Vec<(i64,i64,RigidBodyHandle,PlanetarySweepTrace)>,
     coverage:Vec<i64>, missing:Vec<Vec3>,
     contact_guard:Option<PlanetaryContactGuard>,
+    // One immutable full-interval path per ordinary position-kinematic body. Solver/motor
+    // subdivisions sample this path; they must not consume its endpoint on the first step.
+    kinematic_paths:Option<Vec<(RigidBodyHandle,Pose,Pose)>>,
 }
 pub(super) fn retains(registry:&Registry,scene:i64)->bool {
     registry.preview.as_ref().is_some_and(|p|p.scene==scene)
@@ -113,22 +116,23 @@ fn begin(registry:&mut Registry,scene:i64,ids:&[i64])->Result<Vec<i64>,String> {
     staged.scenes.insert(scene,candidate);
     let id=registry.next_preview.checked_add(1).ok_or("staged interval identity exhausted")?;
     let p=Preview {id,scene,frame:source.epoch,start:source.time_nanos,end:ids[4],mutation:source.mutation,
-        state:0,commands:0,candidate:Some(Box::new(staged)),traces,coverage:vec![],missing:vec![],contact_guard:None};
+        state:0,commands:0,candidate:Some(Box::new(staged)),traces,coverage:vec![],missing:vec![],contact_guard:None,kinematic_paths:None};
     let result=p.header();registry.next_preview=id;registry.preview=Some(p);Ok(result)
 }
 
 fn command(p:&mut Preview,ids:&[i64],values:&[f64])->Result<Vec<i64>,String> {
     if ids.is_empty() || p.commands>=MAX_COMMANDS {return Err("staged command bound or absent operation".into());}
     let op=i32::try_from(ids[0]).map_err(|_|"staged command operation overflow")?;
-    if matches!(op,3|13|42|44|58|72|74|76|77|79|83|90) {
+    if matches!(op,3|13|42|44|58|72|74|76|77|79|83|84|90) {
         if p.state!=0&&p.state!=1 {return Err("candidate reads require open or sealed interval".into());}
     }else{p.open()?;}
     let ids=&ids[1..];
+    if op==10&&p.kinematic_paths.is_some(){return Err("kinematic trajectory already belongs to the retained interval".into());}
     let candidate=p.candidate.as_mut().ok_or("staged scene absent")?;
     let result=match op {
         // Results remain owned across commit. An in-clone ACK would erase publication
         // obligations before the canonical owner had ever received the physical result.
-        3|10|13|42|43|44|58|74..=79|81..=83=>transfer::dispatch(candidate,p.scene,op,ids,values),
+        3|10|13|42|43|44|58|74..=79|81..=84=>transfer::dispatch(candidate,p.scene,op,ids,values),
         90=>controlled_pose::dispatch(candidate,p.scene,op,ids,values),
         91|92=>{
             if transfer::lookup(candidate,p.scene)?.time_nanos!=p.start {
@@ -244,6 +248,17 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
             let c=p.candidate.as_ref().unwrap();
             let now=transfer::lookup(c,scene)?.time_nanos;
             if ids[1]<=0||now.checked_add(ids[1]).is_none_or(|t|t>p.end){return Err("staged step exceeds reserved interval".into());}
+            if p.kinematic_paths.is_none(){
+                let region=transfer::lookup(c,scene)?;
+                let mut paths=Vec::new();
+                for (_,_,handle,_) in &p.traces {
+                    let body=&region.sim.rigid_body_set[*handle];
+                    if body.body_type()==RigidBodyType::KinematicPositionBased{paths.push((*handle,*body.position(),*body.next_position()));}
+                }
+                p.kinematic_paths=Some(paths);
+            }
+            let fraction=(now+ids[1]-p.start) as f64/(p.end-p.start) as f64;
+            let paths=p.kinematic_paths.as_ref().unwrap().clone();
             p.commands+=1;
             if let Some(guard)=&p.contact_guard {guard.snapshot()?;}
             let mut candidate=p.candidate.take().unwrap();
@@ -252,6 +267,15 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
                 // allocation. Original source and other retained clones still count.
                 let guard=PlanetaryContactGuard::new(transfer::remaining_contact_budget(registry,None)?);
                 let sim=&mut candidate.scenes.get_mut(&scene).unwrap().sim;
+                for (handle,start,end) in &paths {
+                    let mut rotation=end.rotation;
+                    if start.rotation.dot(rotation)<0.{rotation=-rotation;}
+                    let target=if fraction==1. {*end}else{Pose {
+                        translation:start.translation+(end.translation-start.translation)*fraction,
+                        rotation:start.rotation.slerp(rotation,fraction),
+                    }};
+                    sim.rigid_body_set[*handle].set_next_kinematic_position(target);
+                }
                 sim.narrow_phase.planetary_clear_contact_guard();
                 sim.narrow_phase.planetary_guard_contacts(&sim.collider_set,&guard)?;
                 advance_region(&mut candidate,scene,ids[1])?;guard.snapshot()?;
