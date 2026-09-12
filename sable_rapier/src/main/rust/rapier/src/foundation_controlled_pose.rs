@@ -221,7 +221,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
             }
             let shape=SharedShape::cuboid(path.half.x,path.half.y,path.half.z);
             if contact_depth(&path.pose,shape.as_ref(),primitive_pose,primitive.as_ref())?>*previous+EPS {
-                return Err("feet transition swept envelope intersects collision".into());
+                return Err(format!("feet transition swept envelope intersects collision: translation={} depth={} previous={} lift={} half={:?} pose={:?}",path.translation.is_some(),contact_depth(&path.pose,shape.as_ref(),primitive_pose,primitive.as_ref())?,previous,lift,path.half,path.pose));
             }
         }
     }
@@ -244,3 +244,4 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
     append_vec(&mut out,coverage.mins);append_vec(&mut out,coverage.maxs);out.extend([paths.len() as i64,candidates as i64,queries as i64]);
     if op==92 {append_vec(&mut out,correction);out.extend([correction_distance.to_bits() as i64,lift.to_bits() as i64]);}Ok(out)
 }
+
