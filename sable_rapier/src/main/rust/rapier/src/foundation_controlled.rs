@@ -862,7 +862,7 @@ pub(super) fn dispatch(
                     // from turning the next coplanar terrain section's edge into a wall.
                     // This is real collision skin on every face, not ignored terrain contact;
                     // its 3mm separation includes the solver's 2.5mm allowed error.
-                    .contact_skin(0.003)
+                    .contact_skin(if ids[1] == 1 { 0.003 } else { 0.0 })
                     .active_events(ActiveEvents::CONTACT_FORCE_EVENTS)
                     .contact_force_event_threshold(0.)
                     .friction(0.)
@@ -1123,4 +1123,5 @@ pub(super) fn dispatch(
         _ => Err("unknown controlled actor operation".into()),
     }
 }
+
 
