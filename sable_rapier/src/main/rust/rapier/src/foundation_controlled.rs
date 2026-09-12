@@ -29,6 +29,7 @@ struct Input {
     terminal: Option<Vec<i64>>,
     terminal_supported: bool,
     post_rules: Option<post_motion::Rules>,
+    item_drag_up: Option<Vec3>,
     final_receipt: Option<Vec<i64>>,
     // Actual force events from all CCD subdivisions; never endpoint support contacts.
     events: Vec<[i64; 16]>,
@@ -586,7 +587,10 @@ pub(super) fn after_step(registry: &mut Registry, scene: i64) -> Result<(), Stri
             bits(pose.rotation.z),
             bits(pose.rotation.w),
         ]);
-        result.extend(vector_bits(velocity));
+        // All ITEM endpoints read the same solved scene before any drag writes. Drag is
+        // an interval force, not solver momentum and not an outer-subdivision operation.
+        let final_velocity=if let Some(up)=input.item_drag_up {post_motion::item_drag(region,a,up,velocity)?} else {velocity};
+        result.extend(vector_bits(final_velocity));
         result.extend(vector_bits(impulse));
         result.push(contacts.len() as i64);
         for (id, epoch, other_actor, kind, point, normal) in contacts {
@@ -594,10 +598,17 @@ pub(super) fn after_step(registry: &mut Registry, scene: i64) -> Result<(), Stri
             result.extend(vector_bits(point));
             result.extend(vector_bits(normal));
         }
-        completed.push((a.id, result));
+        completed.push((a.id, a.body, velocity, final_velocity, result));
     }
-    for (id, result) in completed {
-        registry.controlled.actors.get_mut(&id).unwrap().result = Some(result);
+    for (id, key, before, after, result) in completed {
+        if after!=before {
+            let region=registry.scenes.get_mut(&scene).unwrap();
+            let body=&mut region.sim.rigid_body_set[region.bodies[&key]];
+            body.set_linvel(after,true);body.planetary_refresh_motor_predictions();
+        }
+        let actor=registry.controlled.actors.get_mut(&id).unwrap();
+        actor.input.as_mut().unwrap().applied_motor_delta+=after-before;
+        actor.result = Some(result);
     }
     Ok(())
 }
@@ -642,6 +653,7 @@ pub(super) fn dispatch(
         82 => post_motion::complete(registry,scene,ids,values),
         83 => post_motion::lookup(registry,scene,ids,values),
         85 => post_motion::landing(registry,scene,ids,values),
+        87 => post_motion::prepare_item_drag(registry,scene,ids,values),
         78 => {
             if ids.len()!=10 { return Err("terminal motor requires exact complete input receipt".into()); }
             require(values,6)?;
@@ -740,7 +752,7 @@ pub(super) fn dispatch(
             registry.controlled.actors.get_mut(&ids[0]).unwrap().input = Some(Input {
                 sequence: ids[7], start: ids[8], end: ids[9], velocity,
                 started: false, initial_velocity: velocity, segments, active_segment: 0,
-                applied_motor_delta: Vec3::ZERO, terminal: None, terminal_supported: true, post_rules: None, final_receipt: None, events: Vec::with_capacity(MAX_CONTACTS), impacts: Vec::with_capacity(MAX_CONTACTS), landing_impacts: Vec::with_capacity(MAX_CONTACTS),
+                applied_motor_delta: Vec3::ZERO, terminal: None, terminal_supported: true, post_rules: None, item_drag_up: None, final_receipt: None, events: Vec::with_capacity(MAX_CONTACTS), impacts: Vec::with_capacity(MAX_CONTACTS), landing_impacts: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])
         }
@@ -969,7 +981,7 @@ pub(super) fn dispatch(
                 applied_motor_delta: Vec3::ZERO,
                 terminal: None,
                 terminal_supported: true,
-                post_rules: None,
+                post_rules: None, item_drag_up: None,
                 final_receipt: None,
                 events: Vec::with_capacity(MAX_CONTACTS), impacts: Vec::with_capacity(MAX_CONTACTS), landing_impacts: Vec::with_capacity(MAX_CONTACTS),
             });

@@ -4,6 +4,27 @@ use rapier3d_f64::parry::shape::Shape;
 #[derive(Clone)]
 pub(super) struct Rules { ids:Vec<i64>, values:Vec<i64>, acceleration:Vec3, up:Vec3, flight:i64, component:f64, pub(super) incoming:Vec3 }
 fn vector(words:&[i64],at:usize)->Vec3 {Vec3::new(f64::from_bits(words[at] as u64),f64::from_bits(words[at+1] as u64),f64::from_bits(words[at+2] as u64))}
+/// ITEM gravity is already part of its admitted drive. Only endpoint drag belongs here.
+pub(super) fn prepare_item_drag(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64])->Result<Vec<i64>,String>{
+    if ids.len()!=10{return Err("item drag requires exact input".into());}require(values,3)?;
+    let up=vec(values,0)?;if (up.length()-1.).abs()>1e-6{return Err("item drag needs finite unit gravity up".into());}
+    let a=actor(registry,scene,ids)?;let region=transfer::lookup(registry,scene)?;let input=a.input.as_ref().ok_or("item drag input absent")?;
+    if a.kind!=2||input.started||a.result.is_some()||ids[7..10]!=[input.sequence,input.start,input.end]||input.start!=region.time_nanos||input.end-input.start!=50_000_000 {
+        return Err("item drag requires unstarted ITEM50ms input".into());
+    }
+    if input.item_drag_up.is_some_and(|old|old!=up){return Err("item drag replay changed captured up".into());}
+    registry.controlled.actors.get_mut(&ids[0]).unwrap().input.as_mut().unwrap().item_drag_up=Some(up);
+    let mut receipt=ids[7..10].to_vec();receipt.extend(vector_bits(up));Ok(receipt)
+}
+pub(super) fn item_drag(region:&Region,a:&Actor,up:Vec3,velocity:Vec3)->Result<Vec3,String>{
+    let (support,_)=endpoint(region,a,up,velocity,false)?;
+    let carrier=support.map_or(Vec3::ZERO,|s|s.carrier);
+    let axis=support.map_or(up,|s|s.normal);
+    let relative=velocity-carrier;let normal=axis*relative.dot(axis);
+    let after=carrier+(relative-normal)*(if support.is_some(){0.588}else{0.98})+normal*0.98;
+    if !after.is_finite()||after.length()>MAX_SPEED{return Err("item endpoint drag escaped admitted speed".into());}
+    Ok(after)
+}
 pub(super) fn prepare(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64])->Result<Vec<i64>,String>{
     if ids.len()!=11||!(0..=2).contains(&ids[10]) {return Err("post-motion rules need exact input and flight mode".into());}require(values,11)?;
     let a=actor(registry,scene,ids)?;let region=transfer::lookup(registry,scene)?;let input=a.input.as_ref().ok_or("post-motion input absent")?;

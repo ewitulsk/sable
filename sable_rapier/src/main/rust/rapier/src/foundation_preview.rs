@@ -132,7 +132,7 @@ fn command(p:&mut Preview,ids:&[i64],values:&[f64])->Result<Vec<i64>,String> {
     let result=match op {
         // Results remain owned across commit. An in-clone ACK would erase publication
         // obligations before the canonical owner had ever received the physical result.
-        3|10|13|42|43|44|58|74..=79|81..=86=>transfer::dispatch(candidate,p.scene,op,ids,values),
+        3|10|13|42|43|44|58|74..=79|81..=87=>transfer::dispatch(candidate,p.scene,op,ids,values),
         90=>controlled_pose::dispatch(candidate,p.scene,op,ids,values),
         91|92=>{
             if transfer::lookup(candidate,p.scene)?.time_nanos!=p.start {

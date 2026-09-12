@@ -569,7 +569,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
         },
         20..=27 => character::dispatch(registry,scene,op,ids,values),
         30..=35 => {controlled::transfer_ready(registry,scene,scene)?;terrain_batch::dispatch(registry,scene,op,ids,values)},
-        40..=49 | 57 | 58 | 74..=79 | 81..=86 => controlled::dispatch(registry,scene,op,ids,values),
+        40..=49 | 57 | 58 | 74..=79 | 81..=87 => controlled::dispatch(registry,scene,op,ids,values),
         90 => controlled_pose::dispatch(registry,scene,op,ids,values),
         91|92 => Err("feet-anchored transition requires an unadvanced staged scene".into()),
         _=>Err("unknown typed foundation operation".into()),
