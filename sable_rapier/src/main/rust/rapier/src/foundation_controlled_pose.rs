@@ -177,7 +177,7 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
                 if let Some(contact)=rapier3d_f64::parry::query::contact(&next_pose,shape.as_ref(),pose,primitive.as_ref(),0.)
                     .map_err(|_|"unsupported projection contact primitive")? {
                     let depth=(-contact.dist).max(0.);
-                    if depth>PROJECTION_SKIN&&deepest.as_ref().map_or(true,|(d,_)|depth>*d){deepest=Some((depth,-contact.normal1));}
+                    if depth>EPS&&deepest.as_ref().map_or(true,|(d,_)|depth>*d){deepest=Some((depth,-contact.normal1));}
                 }
             }
             let Some((depth,normal))=deepest else{break};
@@ -244,4 +244,5 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
     append_vec(&mut out,coverage.mins);append_vec(&mut out,coverage.maxs);out.extend([paths.len() as i64,candidates as i64,queries as i64]);
     if op==92 {append_vec(&mut out,correction);out.extend([correction_distance.to_bits() as i64,lift.to_bits() as i64]);}Ok(out)
 }
+
 
