@@ -47,6 +47,27 @@ fn charge(queries:&mut usize)->Result<(),String>{
     if *queries>MAX_QUERIES{return Err("feet transition primitive query capacity".into());}Ok(())
 }
 
+/// Minimum translation along up admitting a separating projection of these two boxes.
+/// The feet plane is not the contact plane on a tilted stance. Use actual primitive axes;
+/// this only proposes a lift, and all three continuous route segments are checked below.
+fn clearance_lift(path:&Envelope,other:&Pose,other_half:Vec3,up:Vec3,allowed:f64)->f64 {
+    if translation_clear(&path.pose,&path.pose,path.half,other,other_half,allowed){return 0.;}
+    let basis=[Vec3::X,Vec3::Y,Vec3::Z];
+    let a=basis.map(|e|path.pose.rotation*e);let b=basis.map(|e|other.rotation*e);
+    let mut axes=Vec::with_capacity(15);axes.extend(a);axes.extend(b);
+    for x in a {for y in b {axes.push(x.cross(y));}}
+    let mut best=f64::INFINITY;
+    for axis in axes {
+        let length=axis.length();if length<1e-12{continue;}
+        let mut n=axis/length;if n.dot(up)<0.{n=-n;}
+        let rate=n.dot(up);if rate<1e-12{continue;}
+        let radius=path.half.dot((path.pose.rotation.inverse()*n).abs())+other_half.dot((other.rotation.inverse()*n).abs());
+        let distance=(radius-allowed-(path.pose.translation-other.translation).dot(n))/rate;
+        best=best.min(distance.max(0.));
+    }
+    best
+}
+
 /// For each rotation interval, every interpolated box is contained in this midpoint box.
 /// Dimensions interpolate linearly in feet-local coordinates (Y ranges from0 to2*halfY).
 /// Rodrigues' formula bounds rotation deviation on each local axis; an invariant yaw/up
@@ -170,6 +191,10 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
         for path in &paths {
             let radius=path.half.dot((path.pose.rotation.inverse()*up).abs());
             lift=f64::max(lift,radius-(path.pose.translation-feet).dot(up));
+            for (pose,primitive,previous) in &primitives {
+                charge(&mut queries)?;
+                lift=lift.max(clearance_lift(path,pose,primitive.as_cuboid().unwrap().half_extents,up,*previous));
+            }
         }
         lift=f64::max(lift,0.);
         if lift>0.{lift+=PROJECTION_SKIN;}
