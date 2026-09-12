@@ -843,10 +843,10 @@ index 48c79be..331c93d 100644
  
  pub use parry::bounding_volume::BoundingVolume;
 diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
-index 7fe12c5..b268868 100644
+index 7fe12c5..a3b5eae 100644
 --- a/src/geometry/narrow_phase.rs
 +++ b/src/geometry/narrow_phase.rs
-@@ -20,12 +20,139 @@ use crate::pipeline::{
+@@ -20,12 +20,140 @@ use crate::pipeline::{
  };
  use crate::prelude::{CollisionEventFlags, MultibodyJointSet};
  use alloc::sync::Arc;
@@ -936,8 +936,9 @@ index 7fe12c5..b268868 100644
 +        // One manifold per primitive pair; workspace detector keys are bounded by n too.
 +        Some(PlanetaryContactLimits { pairs:1, manifolds:n.checked_mul(2)?, points:n.checked_mul(96)? })
 +    }
-+    fn reserve(&self, a: ColliderHandle, b: ColliderHandle, co1: &super::Collider, co2: &super::Collider) -> bool {
-+        let Some(cost) = Self::cost(co1,co2) else { self.fail("unsupported guarded contact shape/sensor/hook"); return false; };
++    fn reserve(&self, a: ColliderHandle, b: ColliderHandle, co1: &super::Collider, co2: &super::Collider, dispatch: bool) -> bool {
++        let Some(mut cost) = Self::cost(co1,co2) else { self.fail("unsupported guarded contact shape/sensor/hook"); return false; };
++        if !dispatch { cost.manifolds=0; cost.points=0; }
 +        let Ok(mut state) = self.inner.lock() else { return false; };
 +        if state.failure.is_some() { return false; }
 +        let key = Self::key(a,b);
@@ -986,7 +987,7 @@ index 7fe12c5..b268868 100644
  #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
  #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
  struct ColliderGraphIndices {
-@@ -62,7 +189,6 @@ enum PairRemovalMode {
+@@ -62,7 +190,6 @@ enum PairRemovalMode {
  ///
  /// **For spatial queries** (raycasts, shape casts), use [`QueryPipeline`](crate::pipeline::QueryPipeline) instead.
  #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
@@ -994,7 +995,7 @@ index 7fe12c5..b268868 100644
  pub struct NarrowPhase {
      #[cfg_attr(
          feature = "serde-serialize",
-@@ -72,6 +198,21 @@ pub struct NarrowPhase {
+@@ -72,6 +199,21 @@ pub struct NarrowPhase {
      contact_graph: InteractionGraph<ColliderHandle, ContactPair>,
      intersection_graph: InteractionGraph<ColliderHandle, IntersectionPair>,
      graph_indices: Coarena<ColliderGraphIndices>,
@@ -1016,7 +1017,7 @@ index 7fe12c5..b268868 100644
  }
  
  pub(crate) type ContactManifoldIndex = usize;
-@@ -83,6 +224,59 @@ impl Default for NarrowPhase {
+@@ -83,6 +225,59 @@ impl Default for NarrowPhase {
  }
  
  impl NarrowPhase {
@@ -1036,7 +1037,7 @@ index 7fe12c5..b268868 100644
 +                guard.fail("contact guard encountered an unreconciled retired collider generation");
 +                return guard.snapshot().map(|_|());
 +            };
-+            if !guard.reserve(pair.collider1,pair.collider2,first,second) {
++            if !guard.reserve(pair.collider1,pair.collider2,first,second,pair.workspace.is_some()||pair.manifolds.capacity()!=0) {
 +                return guard.snapshot().map(|_|());
 +            }
 +        }
@@ -1076,7 +1077,7 @@ index 7fe12c5..b268868 100644
      /// Creates a new empty narrow-phase.
      pub fn new() -> Self {
          Self::with_query_dispatcher(DefaultQueryDispatcher)
-@@ -98,6 +292,8 @@ impl NarrowPhase {
+@@ -98,6 +293,8 @@ impl NarrowPhase {
              contact_graph: InteractionGraph::new(),
              intersection_graph: InteractionGraph::new(),
              graph_indices: Coarena::new(),
@@ -1085,18 +1086,18 @@ index 7fe12c5..b268868 100644
          }
      }
  
-@@ -612,6 +808,10 @@ impl NarrowPhase {
+@@ -612,6 +809,10 @@ impl NarrowPhase {
          if let (Some(co1), Some(co2)) =
              (colliders.get(pair.collider1), colliders.get(pair.collider2))
          {
-+            // Reserve before graph nodes/edge creation and before any dispatcher workspace.
++            // Reserve graph nodes/edge before allocation; dispatcher workspace is charged only if queried.
 +            if let Some(guard) = &self.planetary_contact_guard {
-+                if !guard.reserve(pair.collider1,pair.collider2,co1,co2) { return; }
++                if !guard.reserve(pair.collider1,pair.collider2,co1,co2,false) { return; }
 +            }
              // These colliders have no parents - continue.
  
              let (gid1, gid2) = self.graph_indices.ensure_pair_exists(
-@@ -686,6 +886,7 @@ impl NarrowPhase {
+@@ -686,6 +887,7 @@ impl NarrowPhase {
          broad_phase_events: &[BroadPhasePairEvent],
          events: &dyn EventHandler,
      ) {
@@ -1104,7 +1105,7 @@ index 7fe12c5..b268868 100644
          for event in broad_phase_events {
              match event {
                  BroadPhasePairEvent::AddPair(pair) => {
-@@ -703,6 +904,7 @@ impl NarrowPhase {
+@@ -703,6 +905,7 @@ impl NarrowPhase {
                  }
              }
          }
@@ -1112,7 +1113,7 @@ index 7fe12c5..b268868 100644
      }
  
      #[profiling::function]
-@@ -820,6 +1022,7 @@ impl NarrowPhase {
+@@ -820,6 +1023,7 @@ impl NarrowPhase {
          events: &dyn EventHandler,
      ) {
          let query_dispatcher = &*self.query_dispatcher;
@@ -1120,17 +1121,19 @@ index 7fe12c5..b268868 100644
          #[cfg(feature = "parallel")]
          let (snd, rcv) = std::sync::mpsc::channel();
  
-@@ -829,6 +1032,9 @@ impl NarrowPhase {
-             let had_any_active_contact = pair.has_any_active_contact();
-             let co1 = &colliders[pair.collider1];
-             let co2 = &colliders[pair.collider2];
-+            if let Some(guard) = contact_guard {
-+                if !guard.reserve(pair.collider1,pair.collider2,co1,co2) { return; }
-+            }
-             let rb_handle1 = co1.parent.map(|p| p.handle);
-             let rb_handle2 = co2.parent.map(|p| p.handle);
+@@ -970,6 +1174,11 @@ impl NarrowPhase {
+                     prediction_distance + contact_skin_sum
+                 };
  
-@@ -1114,6 +1320,9 @@ impl NarrowPhase {
++                // All filters above may leave only an empty graph edge (notably fixed terrain pairs).
++                // Reserve the full old/new workspace bound immediately before its first allocation.
++                if let Some(guard) = contact_guard {
++                    if !guard.reserve(pair.collider1,pair.collider2,co1,co2,true) { return; }
++                }
+                 let _ = query_dispatcher.contact_manifolds(
+                     &pos12,
+                     &*co1.shape,
+@@ -1114,6 +1323,9 @@ impl NarrowPhase {
              let co1 = &colliders[pair.collider1];
              let co2 = &colliders[pair.collider2];
              let active_hooks = co1.flags.active_hooks | co2.flags.active_hooks;
@@ -1140,7 +1143,7 @@ index 7fe12c5..b268868 100644
  
              let rb_handle1 = co1.parent.map(|p| p.handle);
              let rb_handle2 = co2.parent.map(|p| p.handle);
-@@ -1148,6 +1357,7 @@ impl NarrowPhase {
+@@ -1148,6 +1360,7 @@ impl NarrowPhase {
              }
          });
  
@@ -1148,7 +1151,7 @@ index 7fe12c5..b268868 100644
          #[cfg(feature = "parallel")]
          {
              drop(snd);
-@@ -1240,6 +1450,96 @@ impl NarrowPhase {
+@@ -1240,6 +1453,132 @@ impl NarrowPhase {
      }
  }
  
@@ -1186,12 +1189,15 @@ index 7fe12c5..b268868 100644
 +        let guard=PlanetaryContactGuard::new(PlanetaryContactLimits {pairs:1,manifolds:7,points:384});
 +        phase.planetary_guard_contacts(&colliders,&guard).unwrap();
 +        phase.add_pair(&colliders,&ColliderPair {collider1:a,collider2:b});
-+        assert_eq!(phase.contact_pairs().count(),0);
++        assert_eq!(phase.contact_pairs().count(),1);
++        assert!(!guard.reserve(a,b,&colliders[a],&colliders[b],true));
++        assert!(phase.contact_graph.graph.edges[0].weight.workspace.is_none());
 +        assert!(guard.snapshot().is_err());
 +        let exact=PlanetaryContactGuard::new(PlanetaryContactLimits {pairs:1,manifolds:8,points:384});
 +        let mut phase=NarrowPhase::new();phase.planetary_guard_contacts(&colliders,&exact).unwrap();
 +        phase.add_pair(&colliders,&ColliderPair {collider1:a,collider2:b});
 +        assert_eq!(phase.contact_pairs().count(),1);
++        assert!(exact.reserve(a,b,&colliders[a],&colliders[b],true));
 +        assert_eq!(exact.snapshot().unwrap().reserved.manifolds,8);
 +    }
 +    #[test]
@@ -1217,7 +1223,7 @@ index 7fe12c5..b268868 100644
 +                let guard=&guard;let accepted=&accepted;
 +                scope.spawn(move || {
 +                    let co=ColliderBuilder::cuboid(1.,1.,1.).build();
-+                    if guard.reserve(ColliderHandle::from_raw_parts(i*2,0),ColliderHandle::from_raw_parts(i*2+1,0),&co,&co) {
++                    if guard.reserve(ColliderHandle::from_raw_parts(i*2,0),ColliderHandle::from_raw_parts(i*2+1,0),&co,&co,true) {
 +                        accepted.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
 +                    }
 +                });
@@ -1231,6 +1237,7 @@ index 7fe12c5..b268868 100644
 +        let (colliders,a,b)=boxes();let mut phase=NarrowPhase::new();
 +        phase.add_pair(&colliders,&ColliderPair {collider1:a,collider2:b});
 +        let guard=PlanetaryContactGuard::new(limits(1));phase.planetary_guard_contacts(&colliders,&guard).unwrap();
++        assert!(guard.reserve(a,b,&colliders[a],&colliders[b],true));
 +        // Merely clearing manifolds does not remove the allocated pair/workspace reservation.
 +        phase.contact_graph.graph.edges[0].weight.clear();guard.observe(phase.contact_pairs());
 +        assert_eq!(guard.snapshot().unwrap().reserved,limits(1));
@@ -1239,6 +1246,38 @@ index 7fe12c5..b268868 100644
 +        drop(phase.contact_graph.remove_edge(ga,gb));guard.observe(phase.contact_pairs());
 +        assert_eq!(guard.snapshot().unwrap().reserved,limits(0));
 +        assert_eq!(guard.snapshot().unwrap().actual,limits(0));
++    }
++    #[test]
++    fn planetary_guard_filtered_sphere_sections_reserve_only_real_dispatch() {
++        use crate::prelude::{CCDSolver,DefaultBroadPhase,IntegrationParameters,PhysicsPipeline,RigidBodyBuilder};
++        use crate::math::Vector;
++        let mut colliders=ColliderSet::new();let mut bodies=RigidBodySet::new();
++        // Two adjacent 16m voxel sections of a radius-24 sphere: 256 nonoverlapping
++        // solid columns each. Their fixed-fixed broadphase edge cannot dispatch.
++        let section=|offset:f64| SharedShape::compound((0..16).flat_map(|x|(0..16).map(move |z|{
++            let dx=offset+x as f64+0.5-16.;let dz=z as f64+0.5-8.;
++            let height=(24_f64*24.-dx*dx-dz*dz).sqrt().floor();
++            (Pose::translation(offset+x as f64+0.5,height/2.,z as f64+0.5),SharedShape::cuboid(0.5,height/2.,0.5))
++        })).collect());
++        let a=colliders.insert(ColliderBuilder::new(section(0.)).build());
++        let b=colliders.insert(ColliderBuilder::new(section(16.)).build());
++        let body=bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(15.5,23.5,7.5)).build());
++        let player=colliders.insert_with_parent(ColliderBuilder::cuboid(0.3,0.5,0.3).build(),body,&mut bodies);
++        let mut phase=NarrowPhase::new();let mut pipeline=PhysicsPipeline::new();let mut islands=IslandManager::new();
++        let mut broad=DefaultBroadPhase::new();let mut joints=ImpulseJointSet::new();let mut multi=MultibodyJointSet::new();let mut ccd=CCDSolver::new();
++        let budget=PlanetaryContactLimits {pairs:8,manifolds:1024,points:49152};
++        let guard=PlanetaryContactGuard::new(budget);phase.planetary_guard_contacts(&colliders,&guard).unwrap();
++        for _ in 0..3 {pipeline.step(Vector::new(0.,-9.81,0.),&IntegrationParameters::default(),&mut islands,&mut broad,&mut phase,&mut bodies,&mut colliders,&mut joints,&mut multi,&mut ccd,&(),&());guard.snapshot().unwrap();}
++        let fixed=phase.contact_pair(a,b).expect("adjacent fixed section edge missing");
++        assert!(fixed.manifolds.is_empty()&&fixed.workspace.is_none());
++        assert!(phase.contact_pair(a,player).unwrap().manifolds.iter().any(|m|!m.points.is_empty()));
++        assert!(bodies[body].translation().y>23.49);
++        assert!(guard.snapshot().unwrap().reserved.points<=49152);
++        // Installing on a retained cache must preserve real dispatch reservations, while
++        // still charging an empty fixed-fixed edge only as a graph allocation.
++        phase.planetary_clear_contact_guard();let next=PlanetaryContactGuard::new(budget);
++        phase.planetary_guard_contacts(&colliders,&next).unwrap();
++        assert!(next.snapshot().unwrap().reserved.points<=49152);
 +    }
 +}
 +
