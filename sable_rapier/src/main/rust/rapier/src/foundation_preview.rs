@@ -123,7 +123,7 @@ fn begin(registry:&mut Registry,scene:i64,ids:&[i64])->Result<Vec<i64>,String> {
 fn command(p:&mut Preview,ids:&[i64],values:&[f64])->Result<Vec<i64>,String> {
     if ids.is_empty() || p.commands>=MAX_COMMANDS {return Err("staged command bound or absent operation".into());}
     let op=i32::try_from(ids[0]).map_err(|_|"staged command operation overflow")?;
-    if matches!(op,3|13|42|44|58|72|74|76|77|79|83|84|85|90) {
+    if matches!(op,3|13|42|44|58|72|74|76|77|79|83|84|85|86|90) {
         if p.state!=0&&p.state!=1 {return Err("candidate reads require open or sealed interval".into());}
     }else{p.open()?;}
     let ids=&ids[1..];
@@ -132,7 +132,7 @@ fn command(p:&mut Preview,ids:&[i64],values:&[f64])->Result<Vec<i64>,String> {
     let result=match op {
         // Results remain owned across commit. An in-clone ACK would erase publication
         // obligations before the canonical owner had ever received the physical result.
-        3|10|13|42|43|44|58|74..=79|81..=85=>transfer::dispatch(candidate,p.scene,op,ids,values),
+        3|10|13|42|43|44|58|74..=79|81..=86=>transfer::dispatch(candidate,p.scene,op,ids,values),
         90=>controlled_pose::dispatch(candidate,p.scene,op,ids,values),
         91|92=>{
             if transfer::lookup(candidate,p.scene)?.time_nanos!=p.start {

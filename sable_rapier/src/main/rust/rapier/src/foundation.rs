@@ -181,8 +181,9 @@ fn advance_region_core(registry: &mut Registry, handle: i64, elapsed_nanos: i64)
     let next_time=current.time_nanos.checked_add(elapsed_nanos).ok_or("simulation clock exhausted")?;
     let next_mutation=current.mutation.checked_add(1).ok_or("scene mutation exhausted")?;
     let next_history=time::prepare_advance(current,handle,next_time)?;
-    let events=controlled::StepEvents::prepare(registry,handle,next_time)?;
+    let mut events=controlled::StepEvents::prepare(registry,handle,next_time)?;
     controlled::before_step(registry,handle,elapsed_nanos)?;
+    events.capture_motor_offsets(registry,handle)?;
     let controlled_participants=controlled::owns_scene(&registry.controlled,handle);
     let region=registry.scenes.get_mut(&handle).unwrap();
     region.sim.step(elapsed_nanos as f64 / 1_000_000_000.,controlled_participants,if controlled_participants { &events } else { &() });region.time_nanos=next_time;region.mutation=next_mutation;

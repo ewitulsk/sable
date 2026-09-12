@@ -33,6 +33,7 @@ struct Input {
     // Actual force events from all CCD subdivisions; never endpoint support contacts.
     events: Vec<[i64; 16]>,
     impacts: Vec<[i64; 17]>,
+    landing_impacts: Vec<[i64; 17]>,
 }
 #[derive(Clone)]
 struct Actor {
@@ -55,11 +56,11 @@ pub(super) struct State {
 /// Rapier invokes the force handler inside CCD subdivisions. Its API exposes dt, not the
 /// subdivision's absolute start, so each event reports the honest enclosing native-step bracket.
 #[derive(Clone, Copy, Default)]
-struct Peer { body: i64, epoch: i64, actor: i64, kind: i64, registration: i64 }
+struct Peer { body: i64, epoch: i64, actor: i64, kind: i64, registration: i64, motor_offset: Vec3 }
 struct EventBuffer {
     counts: HashMap<i64, usize>,
-    rows: Vec<(i64, [i64; 17])>,
-    incoming: HashMap<(ColliderHandle,ColliderHandle,u32,u32),f64>,
+    rows: Vec<(i64, [i64; 18])>,
+    incoming: HashMap<(ColliderHandle,ColliderHandle,u32,u32),(f64,f64)>,
     terminal_ineligible: std::collections::HashSet<i64>,
     failed: bool,
 }
@@ -101,6 +102,20 @@ impl StepEvents {
         Ok(Self { start: region.time_nanos, end, peers,
             buffer: Mutex::new(EventBuffer { counts, rows: Vec::with_capacity(capacity), incoming: HashMap::new(), terminal_ineligible: std::collections::HashSet::with_capacity(MAX_PLAYERS+MAX_ITEMS), failed: false }) })
     }
+    // Gameplay landing evidence removes only explicit PLAYER controller drive. Raw contact
+    // velocities and impulses remain unchanged and independently available through op84.
+    pub(super) fn capture_motor_offsets(&mut self,registry:&Registry,scene:i64)->Result<(),String>{
+        let region=transfer::lookup(registry,scene)?;
+        for actor in registry.controlled.actors.values().filter(|a|a.scene==scene&&a.kind==1){
+            let input=actor.input.as_ref().ok_or("landing motor input absent")?;
+            if let Some(rules)=&input.post_rules{
+                let offset=input.initial_velocity+input.applied_motor_delta-rules.incoming;
+                if !offset.is_finite(){return Err("landing motor offset invalid".into());}
+                self.peers.get_mut(&region.bodies[&actor.body]).ok_or("landing motor peer absent")?.motor_offset=offset;
+            }
+        }
+        Ok(())
+    }
     pub(super) fn finish(self, registry: &mut Registry, scene: i64) -> Result<(), String> {
         let mut buffer = self.buffer.into_inner().map_err(|_|"interval contact collector poisoned")?;
         // Callback scheduling is not an ordering guarantee. Preserve actual step brackets,
@@ -110,7 +125,8 @@ impl StepEvents {
             let actor = registry.controlled.actors.get_mut(&id).ok_or("interval event actor vanished")?;
             if actor.scene != scene { return Err("interval event actor changed scene".into()); }
             let input=actor.input.as_mut().ok_or("interval event input vanished")?;
-            input.events.push(event[..16].try_into().unwrap());input.impacts.push(event);
+            input.events.push(event[..16].try_into().unwrap());input.impacts.push(event[..17].try_into().unwrap());
+            let mut landing:[i64;17]=event[..17].try_into().unwrap();landing[16]=event[17];input.landing_impacts.push(landing);
         }
         for id in buffer.terminal_ineligible {
             registry.controlled.actors.get_mut(&id).ok_or("terminal contact actor vanished")?
@@ -130,13 +146,15 @@ impl EventHandler for StepEvents {
         for manifold in &pair.manifolds {
             if manifold.data.solver_contacts.is_empty(){continue;}
             let key=(pair.collider1,pair.collider2,manifold.subshape1,manifold.subshape2);
-            let speed=manifold.data.solver_contacts.iter().map(|contact| {
+            let offset_a=colliders.get(pair.collider1).and_then(|c|c.parent()).and_then(|h|self.peers.get(&h)).map_or(Vec3::ZERO,|p|p.motor_offset);
+            let offset_b=colliders.get(pair.collider2).and_then(|c|c.parent()).and_then(|h|self.peers.get(&h)).map_or(Vec3::ZERO,|p|p.motor_offset);
+            let (speed,landing)=manifold.data.solver_contacts.iter().map(|contact| {
                 let a=first.map_or(Vec3::ZERO,|b|b.velocity_at_point(contact.point));
                 let b=second.map_or(Vec3::ZERO,|b|b.velocity_at_point(contact.point));
-                (a-b).dot(manifold.data.normal).max(0.)
-            }).fold(0.,f64::max);
-            if !speed.is_finite() || (!buffer.incoming.contains_key(&key) && buffer.incoming.len()>=(MAX_PLAYERS+MAX_ITEMS)*MAX_CONTACTS) {buffer.failed=true;return;}
-            buffer.incoming.insert(key,speed);
+                ((a-b).dot(manifold.data.normal).max(0.),((a-offset_a)-(b-offset_b)).dot(manifold.data.normal).max(0.))
+            }).fold((0_f64,0_f64),|(raw,landing),(a,b)|(raw.max(a),landing.max(b)));
+            if !speed.is_finite() || !landing.is_finite() || (!buffer.incoming.contains_key(&key) && buffer.incoming.len()>=(MAX_PLAYERS+MAX_ITEMS)*MAX_CONTACTS) {buffer.failed=true;return;}
+            buffer.incoming.insert(key,(speed,landing));
         }
     }
     fn handle_collision_event(&self, _: &RigidBodySet, _: &ColliderSet, _: CollisionEvent, _: Option<&ContactPair>) {}
@@ -182,7 +200,7 @@ impl EventHandler for StepEvents {
                 let (slot,generation)=collider.into_raw_parts();
                 buffer.rows.push((recipient.actor, [self.start,self.end,other.body,other.epoch,
                     slot as i64,generation as i64,other.actor,other.kind,other.registration,
-                    bits(point.x),bits(point.y),bits(point.z),bits(outward.x),bits(outward.y),bits(outward.z),bits(impulse),bits(incoming)]));
+                    bits(point.x),bits(point.y),bits(point.z),bits(outward.x),bits(outward.y),bits(outward.z),bits(impulse),bits(incoming.0),bits(incoming.1)]));
             }
         }
     }
@@ -616,7 +634,7 @@ pub(super) fn dispatch(
     ids: &[i64],
     values: &[f64],
 ) -> Result<Vec<i64>, String> {
-    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77 | 79 | 83 | 84 | 85) {
+    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77 | 79 | 83 | 84 | 85 | 86) {
         return Err("controlled actor mutation forbidden during transfer staging".into());
     }
     match op {
@@ -722,7 +740,7 @@ pub(super) fn dispatch(
             registry.controlled.actors.get_mut(&ids[0]).unwrap().input = Some(Input {
                 sequence: ids[7], start: ids[8], end: ids[9], velocity,
                 started: false, initial_velocity: velocity, segments, active_segment: 0,
-                applied_motor_delta: Vec3::ZERO, terminal: None, terminal_supported: true, post_rules: None, final_receipt: None, events: Vec::with_capacity(MAX_CONTACTS), impacts: Vec::with_capacity(MAX_CONTACTS),
+                applied_motor_delta: Vec3::ZERO, terminal: None, terminal_supported: true, post_rules: None, final_receipt: None, events: Vec::with_capacity(MAX_CONTACTS), impacts: Vec::with_capacity(MAX_CONTACTS), landing_impacts: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])
         }
@@ -756,7 +774,7 @@ pub(super) fn dispatch(
             require(values,0)?;
             Ok(vec![1,MAX_CONTACTS as i64,(MAX_PLAYERS+MAX_ITEMS) as i64,16])
         }
-        58 | 84 => {
+        58 | 84 | 86 => {
             if ids.len()!=10 { return Err("interval contact history requires exact result receipt".into()); }
             require(values,0)?;
             let a=actor(registry,scene,ids)?;
@@ -764,7 +782,7 @@ pub(super) fn dispatch(
             if result[11..14]!=ids[7..10] { return Err("interval history result mismatch".into()); }
             let input=a.input.as_ref().ok_or("interval history input absent")?;
             let mut out=result[..14].to_vec();out.push(input.events.len() as i64);
-            if op==84 {for event in &input.impacts {out.extend(event);}} else {for event in &input.events { out.extend(event); }}
+            if op==86 {for event in &input.landing_impacts {out.extend(event);}} else if op==84 {for event in &input.impacts {out.extend(event);}} else {for event in &input.events { out.extend(event); }}
             Ok(out)
         }
         40 => {
@@ -953,7 +971,7 @@ pub(super) fn dispatch(
                 terminal_supported: true,
                 post_rules: None,
                 final_receipt: None,
-                events: Vec::with_capacity(MAX_CONTACTS), impacts: Vec::with_capacity(MAX_CONTACTS),
+                events: Vec::with_capacity(MAX_CONTACTS), impacts: Vec::with_capacity(MAX_CONTACTS), landing_impacts: Vec::with_capacity(MAX_CONTACTS),
             });
             Ok(vec![ids[7], ids[8], ids[9]])
         }
