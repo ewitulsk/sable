@@ -81,10 +81,10 @@ fn endpoint_motor(actual:Vec3,requested:Vec3,events:&[[i64;16]],contacts:&[Endpo
     Err("endpoint motor projection has no numerically verified solution".into())
 }
 fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&dyn Shape,pose:&Pose,
-                     parent:Option<RigidBodyHandle>,up:Vec3,velocity:Vec3,best:&mut Option<Support>,constraints:&mut Vec<EndpointConstraint>,collect:bool,work:&mut usize)->Result<(),String>{
+                     parent:Option<RigidBodyHandle>,up:Vec3,velocity:Vec3,reach:f64,best:&mut Option<Support>,constraints:&mut Vec<EndpointConstraint>,collect:bool,work:&mut usize)->Result<(),String>{
     *work+=1;if *work>16384{return Err("post-motion endpoint primitive cap".into());}
     if let Some(compound)=shape.as_compound(){
-        for (local,part) in compound.shapes(){primitive_support(region,own_shape,own_pose,part.as_ref(),&(*pose * *local),parent,up,velocity,best,constraints,collect,work)?;}
+        for (local,part) in compound.shapes(){primitive_support(region,own_shape,own_pose,part.as_ref(),&(*pose * *local),parent,up,velocity,reach,best,constraints,collect,work)?;}
         return Ok(());
     }
     let own=own_shape.as_cuboid().ok_or("unsupported endpoint actor primitive")?;
@@ -94,14 +94,14 @@ fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&d
     // a large floor/ceiling and measuring its diagonal distance to the small actor.
     // This is a fresh actual-pose geometric query, never cached solver support.
     let mut manifold=rapier3d_f64::parry::query::ContactManifold::<(),()>::new();
-    rapier3d_f64::parry::query::details::contact_manifold_cuboid_cuboid(&own_pose.inv_mul(pose),own,other,0.003,&mut manifold);
+    rapier3d_f64::parry::query::details::contact_manifold_cuboid_cuboid(&own_pose.inv_mul(pose),own,other,reach,&mut manifold);
     if manifold.points.is_empty(){return Ok(());}
     if manifold.points.len()>8{return Err("endpoint cuboid manifold point cap".into());}
     let normal=pose.rotation*manifold.local_n2;
     if !normal.is_finite()||(normal.length()-1.).abs()>1e-6{return Err("invalid endpoint normal".into());}
     for contact in &manifold.points {
         if !contact.dist.is_finite()||contact.dist < -0.005{return Err("post-motion endpoint penetration exceeds physical bound".into());}
-        if contact.dist>0.003{continue;}
+        if contact.dist>reach{continue;}
         let point=*pose*contact.local_p2;
         let carrier=parent.map_or(Vec3::ZERO,|handle|region.sim.rigid_body_set[handle].velocity_at_point(point));
         if !point.is_finite()||!carrier.is_finite(){return Err("invalid endpoint carrier point velocity".into());}
@@ -118,13 +118,16 @@ fn endpoint(region:&Region,a:&Actor,up:Vec3,velocity:Vec3,collect:bool)->Result<
     if region.sim.collider_set.len()>8192{return Err("post-motion endpoint collider cap".into());}
     let own=body.colliders()[0];let collider=&region.sim.collider_set[own];
     let pose=*body.position()*collider.position_wrt_parent().ok_or("endpoint actor parent missing")?;
-    let bounds=collider.shape().compute_aabb(&pose).loosened(0.003);let mut candidates=0;let mut work=0;let mut best=None;let mut constraints=Vec::new();
+    let bounds=collider.shape().compute_aabb(&pose);let mut candidates=0;let mut work=0;let mut best=None;let mut constraints=Vec::new();
     for (handle,other) in region.sim.collider_set.iter(){
         if handle==own||!other.is_enabled()||other.is_sensor()||!collider.collision_groups().test(other.collision_groups())||!collider.solver_groups().test(other.solver_groups()){continue;}
         let actual=other.parent().map_or(*other.position(),|h|*region.sim.rigid_body_set[h].position()*other.position_wrt_parent().unwrap());
-        if !bounds.intersects(&other.shape().compute_aabb(&actual)){continue;}
+        // Compare the real two-collider skin distance, with one nanometre of
+        // arithmetic tolerance shared by broadphase, manifold generation and filtering.
+        let reach=0.003_f64.max(collider.contact_skin()+other.contact_skin())+1e-9;
+        if !bounds.loosened(reach).intersects(&other.shape().compute_aabb(&actual)){continue;}
         candidates+=1;if candidates>64{return Err("post-motion endpoint candidate cap".into());}
-        primitive_support(region,collider.shape(),&pose,other.shape(),&actual,other.parent(),up,velocity,&mut best,&mut constraints,collect,&mut work)?;
+        primitive_support(region,collider.shape(),&pose,other.shape(),&actual,other.parent(),up,velocity,reach,&mut best,&mut constraints,collect,&mut work)?;
     }Ok((best,constraints))
 }
 pub(super) fn complete(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64])->Result<Vec<i64>,String>{
@@ -184,3 +187,4 @@ pub(super) fn landing(registry:&Registry,scene:i64,ids:&[i64],values:&[f64])->Re
     if !speed.is_finite(){return Err("controller landing relative speed invalid".into());}
     let mut out=result[..14].to_vec();out.extend(vector_bits(rules.incoming));out.push(bits(speed));Ok(out)
 }
+
