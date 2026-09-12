@@ -267,6 +267,10 @@ pub(super) fn dispatch(registry:&mut Registry,scene:i64,op:i32,ids:&[i64],values
                 // allocation. Original source and other retained clones still count.
                 let guard=PlanetaryContactGuard::new(transfer::remaining_contact_budget(registry,None)?);
                 let sim=&mut candidate.scenes.get_mut(&scene).unwrap().sim;
+                // Terrain/actor collider retirement is deferred by Rapier until its next
+                // pipeline maintenance. The allocation guard inspects contacts BEFORE that
+                // pipeline step, so settle only exact retired generations in this clone.
+                sim.flush_pending_removals();
                 for (handle,start,end) in &paths {
                     let mut rotation=end.rotation;
                     if start.rotation.dot(rotation)<0.{rotation=-rotation;}

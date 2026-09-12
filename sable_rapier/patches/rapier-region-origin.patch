@@ -834,7 +834,7 @@ index 48c79be..331c93d 100644
  
  pub use parry::bounding_volume::BoundingVolume;
 diff --git a/src/geometry/narrow_phase.rs b/src/geometry/narrow_phase.rs
-index 7fe12c5..12e54bd 100644
+index 7fe12c5..b268868 100644
 --- a/src/geometry/narrow_phase.rs
 +++ b/src/geometry/narrow_phase.rs
 @@ -20,12 +20,139 @@ use crate::pipeline::{
@@ -1007,7 +1007,7 @@ index 7fe12c5..12e54bd 100644
  }
  
  pub(crate) type ContactManifoldIndex = usize;
-@@ -83,6 +224,55 @@ impl Default for NarrowPhase {
+@@ -83,6 +224,59 @@ impl Default for NarrowPhase {
  }
  
  impl NarrowPhase {
@@ -1023,7 +1023,11 @@ index 7fe12c5..12e54bd 100644
 +            return guard.snapshot().map(|_|());
 +        }
 +        for pair in self.contact_pairs() {
-+            if !guard.reserve(pair.collider1,pair.collider2,&colliders[pair.collider1],&colliders[pair.collider2]) {
++            let (Some(first),Some(second))=(colliders.get(pair.collider1),colliders.get(pair.collider2)) else {
++                guard.fail("contact guard encountered an unreconciled retired collider generation");
++                return guard.snapshot().map(|_|());
++            };
++            if !guard.reserve(pair.collider1,pair.collider2,first,second) {
 +                return guard.snapshot().map(|_|());
 +            }
 +        }
@@ -1063,7 +1067,7 @@ index 7fe12c5..12e54bd 100644
      /// Creates a new empty narrow-phase.
      pub fn new() -> Self {
          Self::with_query_dispatcher(DefaultQueryDispatcher)
-@@ -98,6 +288,8 @@ impl NarrowPhase {
+@@ -98,6 +292,8 @@ impl NarrowPhase {
              contact_graph: InteractionGraph::new(),
              intersection_graph: InteractionGraph::new(),
              graph_indices: Coarena::new(),
@@ -1072,7 +1076,7 @@ index 7fe12c5..12e54bd 100644
          }
      }
  
-@@ -612,6 +804,10 @@ impl NarrowPhase {
+@@ -612,6 +808,10 @@ impl NarrowPhase {
          if let (Some(co1), Some(co2)) =
              (colliders.get(pair.collider1), colliders.get(pair.collider2))
          {
@@ -1083,7 +1087,7 @@ index 7fe12c5..12e54bd 100644
              // These colliders have no parents - continue.
  
              let (gid1, gid2) = self.graph_indices.ensure_pair_exists(
-@@ -686,6 +882,7 @@ impl NarrowPhase {
+@@ -686,6 +886,7 @@ impl NarrowPhase {
          broad_phase_events: &[BroadPhasePairEvent],
          events: &dyn EventHandler,
      ) {
@@ -1091,7 +1095,7 @@ index 7fe12c5..12e54bd 100644
          for event in broad_phase_events {
              match event {
                  BroadPhasePairEvent::AddPair(pair) => {
-@@ -703,6 +900,7 @@ impl NarrowPhase {
+@@ -703,6 +904,7 @@ impl NarrowPhase {
                  }
              }
          }
@@ -1099,7 +1103,7 @@ index 7fe12c5..12e54bd 100644
      }
  
      #[profiling::function]
-@@ -820,6 +1018,7 @@ impl NarrowPhase {
+@@ -820,6 +1022,7 @@ impl NarrowPhase {
          events: &dyn EventHandler,
      ) {
          let query_dispatcher = &*self.query_dispatcher;
@@ -1107,7 +1111,7 @@ index 7fe12c5..12e54bd 100644
          #[cfg(feature = "parallel")]
          let (snd, rcv) = std::sync::mpsc::channel();
  
-@@ -829,6 +1028,9 @@ impl NarrowPhase {
+@@ -829,6 +1032,9 @@ impl NarrowPhase {
              let had_any_active_contact = pair.has_any_active_contact();
              let co1 = &colliders[pair.collider1];
              let co2 = &colliders[pair.collider2];
@@ -1117,7 +1121,7 @@ index 7fe12c5..12e54bd 100644
              let rb_handle1 = co1.parent.map(|p| p.handle);
              let rb_handle2 = co2.parent.map(|p| p.handle);
  
-@@ -1114,6 +1316,9 @@ impl NarrowPhase {
+@@ -1114,6 +1320,9 @@ impl NarrowPhase {
              let co1 = &colliders[pair.collider1];
              let co2 = &colliders[pair.collider2];
              let active_hooks = co1.flags.active_hooks | co2.flags.active_hooks;
@@ -1127,7 +1131,7 @@ index 7fe12c5..12e54bd 100644
  
              let rb_handle1 = co1.parent.map(|p| p.handle);
              let rb_handle2 = co2.parent.map(|p| p.handle);
-@@ -1148,6 +1353,7 @@ impl NarrowPhase {
+@@ -1148,6 +1357,7 @@ impl NarrowPhase {
              }
          });
  
@@ -1135,7 +1139,7 @@ index 7fe12c5..12e54bd 100644
          #[cfg(feature = "parallel")]
          {
              drop(snd);
-@@ -1240,6 +1446,96 @@ impl NarrowPhase {
+@@ -1240,6 +1450,96 @@ impl NarrowPhase {
      }
  }
  
@@ -1232,10 +1236,25 @@ index 7fe12c5..12e54bd 100644
  #[cfg(test)]
  #[cfg(feature = "f32")]
  #[cfg(feature = "dim3")]
+diff --git a/src/pipeline/event_handler.rs b/src/pipeline/event_handler.rs
+index 00ab832..ee03b5b 100644
+--- a/src/pipeline/event_handler.rs
++++ b/src/pipeline/event_handler.rs
+@@ -88,6 +88,9 @@ impl Default for ActiveEvents {
+ /// }
+ /// ```
+ pub trait EventHandler: Send + Sync {
++    /// Read-only observation immediately before solving active contact constraints. This
++    /// cannot modify contact geometry or bypass the planetary contact coverage guard.
++    fn handle_contact_pre_solve(&self, _bodies: &RigidBodySet, _colliders: &ColliderSet, _pair: &ContactPair) {}
+     /// Called when two colliders start or stop touching each other.
+     ///
+     /// Collision events are triggered when intersection state changes (Started/Stopped).
 diff --git a/src/pipeline/physics_pipeline.rs b/src/pipeline/physics_pipeline.rs
+index 9b6e5ac..354e7b5 100644
 --- a/src/pipeline/physics_pipeline.rs
 +++ b/src/pipeline/physics_pipeline.rs
-@@ -224,6 +224,15 @@
+@@ -224,6 +224,15 @@ impl PhysicsPipeline {
              .stages
              .island_constraints_collection_time
              .resume();
@@ -1251,7 +1270,7 @@ diff --git a/src/pipeline/physics_pipeline.rs b/src/pipeline/physics_pipeline.rs
          let mut manifolds = Vec::new();
          narrow_phase.select_active_contacts(
              islands,
-@@ -404,6 +413,7 @@
+@@ -404,6 +413,7 @@ impl PhysicsPipeline {
          for handle in islands.active_bodies() {
              let rb = bodies.index_mut_internal(handle);
              rb.pos.position = rb.pos.next_position;
@@ -1274,16 +1293,3 @@ index 47a76a3..606bcbf 100644
              }
  
              rb.activation = activation;
-diff --git a/src/pipeline/event_handler.rs b/src/pipeline/event_handler.rs
---- a/src/pipeline/event_handler.rs
-+++ b/src/pipeline/event_handler.rs
-@@ -88,6 +88,9 @@
- /// }
- /// ```
- pub trait EventHandler: Send + Sync {
-+    /// Read-only observation immediately before solving active contact constraints. This
-+    /// cannot modify contact geometry or bypass the planetary contact coverage guard.
-+    fn handle_contact_pre_solve(&self, _bodies: &RigidBodySet, _colliders: &ColliderSet, _pair: &ContactPair) {}
-     /// Called when two colliders start or stop touching each other.
-     ///
-     /// Collision events are triggered when intersection state changes (Started/Stopped).

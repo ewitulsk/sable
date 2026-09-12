@@ -37,6 +37,7 @@ pub(super) fn advance(registry:&mut Registry,scene:i64,nanos:i64)->Result<(),Str
     // No exclusion: all authoritative scenes and the retained preview still consume memory.
     let guard=PlanetaryContactGuard::new(transfer::remaining_contact_budget(registry,None)?);
     let sim=&mut staged.scenes.get_mut(&scene).unwrap().sim;
+    sim.flush_pending_removals();
     sim.narrow_phase.planetary_clear_contact_guard();
     sim.narrow_phase.planetary_guard_contacts(&sim.collider_set,&guard)?;
     advance_region_core(&mut staged,scene,nanos)?;

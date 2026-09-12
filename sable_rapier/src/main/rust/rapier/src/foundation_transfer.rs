@@ -88,7 +88,7 @@ pub(super) fn preview_budget(registry:&Registry, candidate:&Simulation)->Result<
 impl Simulation {
     /// Settle exact retired collider generations in a staged owner before reusing arena slots.
     /// This is maintenance of deferred removals, not a simulation step or a contact reset.
-    fn flush_pending_removals(&mut self) {
+    pub(super) fn flush_pending_removals(&mut self) {
         let removed=self.collider_set.take_removed();
         if removed.is_empty(){return;}
         self.narrow_phase.handle_user_changes(Some(&mut self.island_manager),&[],&removed,
