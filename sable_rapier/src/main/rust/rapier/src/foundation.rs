@@ -650,6 +650,10 @@ pub extern "system" fn Java_dev_planetarysable_world_physics_FoundationNative_in
                             return Err("stale frame epoch".into());
                         }
                         sim.validate_bounds(delta)?;
+                        // Sliding terrain interests may retire/reuse collider arena indices
+                        // while input is held for rebase. Reconcile exact generations before
+                        // translating cached contact points and broad-phase leaves.
+                        sim.flush_pending_removals();
                         sim.rigid_body_set.planetary_shift_origin(delta);
                         sim.collider_set.planetary_shift_origin(delta);
                         sim.narrow_phase.planetary_shift_origin(delta);
