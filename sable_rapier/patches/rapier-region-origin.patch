@@ -676,10 +676,10 @@ index 66973ef..5ef0e5e 100644
  
          // TODO PERF: SIMD-optimized integration. Works fine, but doesn’t run faster than the scalar
 diff --git a/src/geometry/broad_phase_bvh.rs b/src/geometry/broad_phase_bvh.rs
-index 23abb79..7c2507e 100644
+index 23abb79..f974c71 100644
 --- a/src/geometry/broad_phase_bvh.rs
 +++ b/src/geometry/broad_phase_bvh.rs
-@@ -53,6 +53,70 @@ pub enum BvhOptimizationStrategy {
+@@ -53,6 +53,74 @@ pub enum BvhOptimizationStrategy {
  const ENABLE_TREE_VALIDITY_CHECK: bool = false;
  
  impl BroadPhaseBvh {
@@ -743,14 +743,18 @@ index 23abb79..7c2507e 100644
 +                (key as usize, Aabb::new(aabb.mins - delta, aabb.maxs - delta))
 +            })
 +        }).collect();
-+        self.tree = Bvh::from_iter(parry::partitioning::BvhBuildStrategy::Binned, leaves);
++        // A bulk-built BVH clears change flags. That loses new contact pairs for a
++        // just-published/reused collider whose unchanged AABB survives this origin shift.
++        // Reinsert exact padded leaves with change detection; existing pairs remain intact.
++        self.tree = Bvh::default();
++        for (key, aabb) in leaves { self.tree.insert_with_change_detection(aabb, key as u32, 0.0); }
 +        self.workspace = BvhWorkspace::default();
 +    }
 +
      const CHANGE_DETECTION_ENABLED: bool = true;
      const CHANGE_DETECTION_FACTOR: Real = 1.0e-2;
  
-@@ -161,6 +225,9 @@ impl BroadPhaseBvh {
+@@ -161,6 +229,9 @@ impl BroadPhaseBvh {
          // let t0 = std::time::Instant::now();
          self.tree.refit(&mut self.workspace);
  
@@ -760,6 +764,11 @@ index 23abb79..7c2507e 100644
          if ENABLE_TREE_VALIDITY_CHECK {
              self.tree.assert_well_formed();
          }
+@@ -280,3 +351,4 @@ impl BroadPhaseBvh {
+         );
+     }
+ }
++
 diff --git a/src/geometry/collider_set.rs b/src/geometry/collider_set.rs
 index 2de2803..53178e1 100644
 --- a/src/geometry/collider_set.rs
