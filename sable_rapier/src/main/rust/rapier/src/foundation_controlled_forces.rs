@@ -2,7 +2,7 @@
 use super::*;
 use rapier3d_f64::parry::shape::Shape;
 #[derive(Clone)]
-pub(super) struct Rules { ids:Vec<i64>, values:Vec<i64>, acceleration:Vec3, up:Vec3, flight:i64, component:f64 }
+pub(super) struct Rules { ids:Vec<i64>, values:Vec<i64>, acceleration:Vec3, up:Vec3, flight:i64, component:f64, incoming:Vec3 }
 fn vector(words:&[i64],at:usize)->Vec3 {Vec3::new(f64::from_bits(words[at] as u64),f64::from_bits(words[at+1] as u64),f64::from_bits(words[at+2] as u64))}
 pub(super) fn prepare(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64])->Result<Vec<i64>,String>{
     if ids.len()!=11||!(0..=2).contains(&ids[10]) {return Err("post-motion rules need exact input and flight mode".into());}require(values,11)?;
@@ -19,7 +19,10 @@ pub(super) fn prepare(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64])
         ||(rotation.length_squared()-1.).abs()>1e-6||(1.-rotation.dot(actual).abs()).abs()>1e-10||(actual*Vec3::Y-up).length()>1e-8 {
         return Err("post-motion captured field/orientation/flight bound or CAS mismatch".into());
     }
-    registry.controlled.actors.get_mut(&ids[0]).unwrap().input.as_mut().unwrap().post_rules=Some(Rules {ids:ids.to_vec(),values:encoded,acceleration,up,flight:ids[10],component:values[6]});
+    // Preserve the actual native sample before the first controller drive replaces it.
+    // A Java collision-clipped leg must not become the incoming landing speed.
+    let incoming=actor_body(region,a)?.linvel();
+    registry.controlled.actors.get_mut(&ids[0]).unwrap().input.as_mut().unwrap().post_rules=Some(Rules {ids:ids.to_vec(),values:encoded,acceleration,up,flight:ids[10],component:values[6],incoming});
     Ok(vec![ids[7],ids[8],ids[9],ids[10]])
 }
 #[derive(Clone,Copy)]
@@ -165,4 +168,19 @@ pub(super) fn lookup(registry:&Registry,scene:i64,ids:&[i64],values:&[f64])->Res
     let a=actor(registry,scene,ids)?;let result=a.result.as_ref().ok_or("final receipt result absent")?;
     if result[11..14]!=ids[7..10]{return Err("final receipt lookup input mismatch".into());}
     Ok(a.input.as_ref().ok_or("final receipt input absent")?.final_receipt.clone().unwrap_or_default())
+}
+
+/// Separate controller-landing evidence: actual pre-drive native momentum resolved into
+/// the confirmed endpoint material's contact frame. This is not a solver impulse or CCD
+/// timestamp. No support, no walking mode, or no inward relative momentum means zero.
+pub(super) fn landing(registry:&Registry,scene:i64,ids:&[i64],values:&[f64])->Result<Vec<i64>,String>{
+    if ids.len()!=10{return Err("controller landing requires exact final input".into());}require(values,0)?;
+    let a=actor(registry,scene,ids)?;let result=a.result.as_ref().ok_or("controller landing result absent")?;
+    if result[11..14]!=ids[7..10]{return Err("controller landing result mismatch".into());}
+    let input=a.input.as_ref().ok_or("controller landing input absent")?;
+    let rules=input.post_rules.as_ref().ok_or("controller landing rules absent")?;
+    let final_result=input.final_receipt.as_ref().ok_or("controller landing endpoint not finalized")?;
+    let speed=if rules.flight==0&&final_result[25]==1 {(-(rules.incoming-vector(final_result,29)).dot(vector(final_result,26))).max(0.)}else{0.};
+    if !speed.is_finite(){return Err("controller landing relative speed invalid".into());}
+    let mut out=result[..14].to_vec();out.extend(vector_bits(rules.incoming));out.push(bits(speed));Ok(out)
 }

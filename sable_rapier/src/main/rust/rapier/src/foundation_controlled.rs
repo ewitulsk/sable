@@ -612,13 +612,14 @@ pub(super) fn dispatch(
     ids: &[i64],
     values: &[f64],
 ) -> Result<Vec<i64>, String> {
-    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77 | 79 | 83 | 84) {
+    if registry.transfer.is_some() && !matches!(op, 40 | 42 | 44 | 57 | 58 | 74 | 76 | 77 | 79 | 83 | 84 | 85) {
         return Err("controlled actor mutation forbidden during transfer staging".into());
     }
     match op {
         81 => post_motion::prepare(registry,scene,ids,values),
         82 => post_motion::complete(registry,scene,ids,values),
         83 => post_motion::lookup(registry,scene,ids,values),
+        85 => post_motion::landing(registry,scene,ids,values),
         78 => {
             if ids.len()!=10 { return Err("terminal motor requires exact complete input receipt".into()); }
             require(values,6)?;
