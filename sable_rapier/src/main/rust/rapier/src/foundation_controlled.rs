@@ -441,9 +441,13 @@ pub(super) fn before_step(registry: &mut Registry, scene: i64, nanos: i64) -> Re
                 return Err("controlled motor skipped its exact boundary".into());
             }
             let drive = if input.segments.is_empty() { input.velocity } else { input.segments[segment].velocity };
-            let delta = if input.started { drive - input.segments[input.active_segment].velocity } else { Vec3::ZERO };
+            let delta = if input.started {
+                terminal_projection(body.linvel(),input.segments[input.active_segment].velocity,drive,&input.events)?.0
+            } else { Vec3::ZERO };
             // First drive is total desired velocity. Later drives preserve this input's
-            // external response. The delta itself may be 640 m/s for opposite legal drives.
+            // external response. A completed contact may already have cancelled the old
+            // inward drive; adding its cancellation again would manufacture an outward hop.
+            // Project only the new controller delta, never the actual solver response.
             let velocity = if input.started { body.linvel() + delta } else { drive };
             if !velocity.is_finite() || velocity.length() > MAX_SPEED {
                 return Err("segmented motor plus retained reaction exceeds admitted speed".into());
