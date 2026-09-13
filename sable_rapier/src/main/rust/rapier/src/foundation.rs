@@ -148,7 +148,21 @@ impl Simulation {
             // Resolve the 320:1 PLAYER/ITEM stack within the existing 5mm endpoint bound.
             // This bounded inner solve improves contact convergence without changing masses,
             // contact geometry, elapsed time or the penetration acceptance threshold.
-            step_parameters.num_internal_pgs_iterations = if mixed_player_items {64} else {8};
+            step_parameters.num_internal_pgs_iterations = 8;
+            if mixed_player_items {
+                // A two-contact heavy/light stack contracts its PGS residual by roughly
+                // 1-min_mass/max_mass each sweep. Budget enough work to reduce the
+                // actual approach displacement below 0.25mm, with a hard finite cap.
+                // Complex chains remain protected by the unchanged endpoint refusal.
+                let mut minimum=f64::INFINITY;let mut maximum=0.0_f64;let mut speed=0.0_f64;
+                for (_,body) in self.rigid_body_set.iter().filter(|(_,b)|b.is_dynamic()) {
+                    let mass=body.mass();if mass>0. {minimum=minimum.min(mass);maximum=maximum.max(mass);}
+                    speed=speed.max(body.linvel().length());
+                }
+                let ratio=(maximum/minimum).max(1.);
+                let residual=(2.*speed*dt/20./0.00025).max(1.);
+                step_parameters.num_internal_pgs_iterations=(ratio*residual.ln()).ceil().clamp(64.,2048.) as usize;
+            }
             // More position-integrating small steps bound transient compression during
             // real approach impacts; inner sweeps alone cannot refine their time span.
             if mixed_player_items {step_parameters.num_solver_iterations=12;}
