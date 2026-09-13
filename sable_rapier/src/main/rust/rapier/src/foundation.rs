@@ -149,6 +149,9 @@ impl Simulation {
             // This bounded inner solve improves contact convergence without changing masses,
             // contact geometry, elapsed time or the penetration acceptance threshold.
             step_parameters.num_internal_pgs_iterations = if mixed_player_items {64} else {8};
+            // More position-integrating small steps bound transient compression during
+            // real approach impacts; inner sweeps alone cannot refine their time span.
+            if mixed_player_items {step_parameters.num_solver_iterations=12;}
             // Players/items require near-rigid unilateral contact, not the default deliberately
             // compliant 30Hz/damping5 spring. These finite coefficients are the pinned Rapier
             // rigid-joint defaults; masses, CCD and allowed penetration error are unchanged.
