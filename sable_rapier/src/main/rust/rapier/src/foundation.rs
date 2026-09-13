@@ -148,7 +148,7 @@ impl Simulation {
             // Resolve the 320:1 PLAYER/ITEM stack within the existing 5mm endpoint bound.
             // This bounded inner solve improves contact convergence without changing masses,
             // contact geometry, elapsed time or the penetration acceptance threshold.
-            step_parameters.num_internal_pgs_iterations = 32;
+            step_parameters.num_internal_pgs_iterations = 64;
             // Players/items require near-rigid unilateral contact, not the default deliberately
             // compliant 30Hz/damping5 spring. These finite coefficients are the pinned Rapier
             // rigid-joint defaults; masses, CCD and allowed penetration error are unchanged.
