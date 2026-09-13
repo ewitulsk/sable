@@ -461,7 +461,8 @@ pub(super) fn before_step(registry: &mut Registry, scene: i64, nanos: i64) -> Re
             }
             let drive = if input.segments.is_empty() { input.velocity } else { input.segments[segment].velocity };
             let delta = if input.started {
-                terminal_projection(body.linvel(),input.segments[input.active_segment].velocity,drive,&input.events)?.0
+                let previous=if input.post_rules.is_some(){input.initial_velocity+input.applied_motor_delta}else{input.segments[input.active_segment].velocity};
+                post_motion::controller_delta(region,a,input,body.linvel(),previous,drive)?.0
             } else { Vec3::ZERO };
             // First drive is total desired velocity. Later drives preserve this input's
             // external response. A completed contact may already have cancelled the old
@@ -684,8 +685,11 @@ pub(super) fn dispatch(
                 || collider.restitution()!=0. || collider.restitution_combine_rule()!=CoefficientCombineRule::Min {
                 return Err("terminal motor requires retained frictionless actor contract".into());
             }
-            let drive=input.segments.last().map_or(input.velocity,|segment|segment.velocity);
-            let (correction,rank)=terminal_projection(expected,drive,target,&input.events)?;
+            // A bounded endpoint may have rejected part of an earlier drive without a
+            // solver impulse. Never cancel that unapplied component into a new velocity.
+            let drive=if input.post_rules.is_some(){input.initial_velocity+input.applied_motor_delta}
+                else{input.segments.last().map_or(input.velocity,|segment|segment.velocity)};
+            let (correction,rank)=post_motion::controller_delta(region,a,input,expected,drive,target)?;
             let after=expected+correction;
             let next_mutation=region.mutation.checked_add(1).ok_or("terminal motor mutation exhausted")?;
             let key=a.body;

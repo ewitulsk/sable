@@ -151,6 +151,17 @@ fn endpoint(region:&Region,a:&Actor,up:Vec3,velocity:Vec3,collect:bool)->Result<
         primitive_support(region,collider.shape(),&pose,other.shape(),&actual,other.parent(),up,velocity,reach,&mut best,&mut constraints,collect,&mut work)?;
     }Ok((best,constraints))
 }
+/// A real endpoint can constrain motion without having generated a positive impulse
+/// (for example a stationary skin-distance floor). Constrain only the next motor delta;
+/// retained solver velocity and its positive-impulse nullspace remain untouched.
+pub(super) fn controller_delta(region:&Region,a:&Actor,input:&Input,actual:Vec3,drive:Vec3,target:Vec3)->Result<(Vec3,usize),String>{
+    let (projected,rank)=terminal_projection(actual,drive,target,&input.events)?;
+    let Some(rules)=&input.post_rules else{return Ok((projected,rank));};
+    let (_,constraints)=endpoint(region,a,rules.up,actual,true)?;
+    let delta=endpoint_motor(actual,target-drive,&input.events,&constraints)?;
+    if !(actual+delta).is_finite()||(actual+delta).length()>MAX_SPEED{return Err("endpoint controller plus retained response exceeds speed envelope".into());}
+    Ok((delta,rank))
+}
 pub(super) fn complete(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64])->Result<Vec<i64>,String>{
     if ids.len()!=10{return Err("post-motion finalization requires exact input".into());}require(values,0)?;
     let a=actor(registry,scene,ids)?;let region=transfer::lookup(registry,scene)?;let input=a.input.as_ref().ok_or("post-motion input absent")?;
