@@ -138,7 +138,7 @@ impl Simulation {
             },
         }
     }
-    fn step(&mut self, dt: f64, controlled_participants: bool, events: &dyn EventHandler) {
+    fn step(&mut self, dt: f64, controlled_participants: bool, mixed_player_items: bool, events: &dyn EventHandler) {
         self.parameters.dt = dt;
         // Resolve the complete contact patch before each small-step rotation integration.
         // Extra island iterations alone still use one PGS sweep and can leave an asymmetric
@@ -148,7 +148,7 @@ impl Simulation {
             // Resolve the 320:1 PLAYER/ITEM stack within the existing 5mm endpoint bound.
             // This bounded inner solve improves contact convergence without changing masses,
             // contact geometry, elapsed time or the penetration acceptance threshold.
-            step_parameters.num_internal_pgs_iterations = 64;
+            step_parameters.num_internal_pgs_iterations = if mixed_player_items {64} else {8};
             // Players/items require near-rigid unilateral contact, not the default deliberately
             // compliant 30Hz/damping5 spring. These finite coefficients are the pinned Rapier
             // rigid-joint defaults; masses, CCD and allowed penetration error are unchanged.
@@ -188,8 +188,9 @@ fn advance_region_core(registry: &mut Registry, handle: i64, elapsed_nanos: i64)
     controlled::before_step(registry,handle,elapsed_nanos)?;
     events.capture_motor_offsets(registry,handle)?;
     let controlled_participants=controlled::owns_scene(&registry.controlled,handle);
+    let mixed_player_items=controlled::mixed_player_items(&registry.controlled,handle);
     let region=registry.scenes.get_mut(&handle).unwrap();
-    region.sim.step(elapsed_nanos as f64 / 1_000_000_000.,controlled_participants,if controlled_participants { &events } else { &() });region.time_nanos=next_time;region.mutation=next_mutation;
+    region.sim.step(elapsed_nanos as f64 / 1_000_000_000.,controlled_participants,mixed_player_items,if controlled_participants { &events } else { &() });region.time_nanos=next_time;region.mutation=next_mutation;
     region.body_history=next_history;
     if let Err(error)=region.sim.validate_bounds(Vec3::ZERO){region.failed_range=true;return Err(error);}
     if let Err(error)=events.finish(registry,handle){registry.scenes.get_mut(&handle).unwrap().failed_range=true;return Err(error);}

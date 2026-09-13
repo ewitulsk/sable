@@ -225,6 +225,10 @@ pub(super) fn owns_body(state: &State, scene: i64, id: i64) -> bool {
         .values()
         .any(|a| a.scene == scene && a.body == id)
 }
+/// High mass-ratio contact chain admitted by the shared PLAYER/ITEM scene.
+pub(super) fn mixed_player_items(state:&State,scene:i64)->bool {
+    state.actors.values().any(|a|a.scene==scene&&a.kind==1)&&state.actors.values().any(|a|a.scene==scene&&a.kind==2)
+}
 pub(super) fn owns_scene(state: &State, scene: i64) -> bool {
     state.actors.values().any(|a| a.scene == scene)
 }
