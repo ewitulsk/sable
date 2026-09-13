@@ -49,16 +49,19 @@ pub(super) fn prepare(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64])
 #[derive(Clone,Copy)]
 struct Support { normal:Vec3,carrier:Vec3,point:Vec3,body:i64,epoch:i64 }
 #[derive(Clone,Copy)]
-struct EndpointConstraint { normal:Vec3,carrier:Vec3 }
+struct EndpointConstraint { normal:Vec3,carrier:Vec3,collider:ColliderHandle }
 // Minimize change to the requested controller impulse, never project actual velocity.
 // The feasible origin guarantees that an existing solver response can remain untouched.
 // At most three independent active planes define the Euclidean projection in 3D.
 fn endpoint_motor(actual:Vec3,requested:Vec3,events:&[[i64;16]],contacts:&[EndpointConstraint])->Result<Vec3,String>{
+    endpoint_motor_bounded(actual,requested,events,contacts,&[])
+}
+fn endpoint_motor_bounded(actual:Vec3,requested:Vec3,events:&[[i64;16]],contacts:&[EndpointConstraint],bounds:&[(Vec3,f64)])->Result<Vec3,String>{
     if contacts.len()>64{return Err("endpoint motor constraint cap".into());}
     let project=|value:Vec3| { let scale=value.length().max(1.); terminal_projection(Vec3::ZERO,Vec3::ZERO,value/scale,events).map(|v|v.0*scale) };
     let wanted=project(requested)?;
     let basis=[project(Vec3::X)?,project(Vec3::Y)?,project(Vec3::Z)?];
-    let mut planes=Vec::with_capacity(contacts.len());
+    let mut planes:Vec<(Vec3,f64)>=Vec::with_capacity(contacts.len());
     for contact in contacts {
         let n=contact.normal;
         let q=basis[0]*n.x+basis[1]*n.y+basis[2]*n.z;
@@ -66,8 +69,14 @@ fn endpoint_motor(actual:Vec3,requested:Vec3,events:&[[i64;16]],contacts:&[Endpo
         // inward relative motion nor worsen any inward solver response already present.
         let lower=(-(actual-contact.carrier).dot(n)).min(0.);
         if !q.is_finite()||!lower.is_finite(){return Err("invalid endpoint motor plane".into());}
-        planes.push((q,lower));
+        if let Some((_,old))=planes.iter_mut().find(|(axis,_)|*axis==q){*old=f64::max(*old,lower);}else{planes.push((q,lower));}
     }
+    for (n,lower) in bounds {
+        let q=basis[0]*n.x+basis[1]*n.y+basis[2]*n.z;
+        if !q.is_finite()||!lower.is_finite(){return Err("invalid endpoint motor cancellation bound".into());}
+        if let Some((_,old))=planes.iter_mut().find(|(axis,_)|*axis==q){*old=f64::max(*old,*lower);}else{planes.push((q,*lower));}
+    }
+    if planes.len()>64{return Err("endpoint motor total constraint cap".into());}
     let feasible=|value:Vec3| value.is_finite()&&planes.iter().all(|(q,b)|q.dot(value)>=*b-1e-8);
     if feasible(wanted){return Ok(wanted);}
     let mut work=0;
@@ -102,10 +111,10 @@ fn endpoint_motor(actual:Vec3,requested:Vec3,events:&[[i64;16]],contacts:&[Endpo
     Err("endpoint motor projection has no numerically verified solution".into())
 }
 fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&dyn Shape,pose:&Pose,
-                     parent:Option<RigidBodyHandle>,up:Vec3,velocity:Vec3,reach:f64,best:&mut Option<Support>,constraints:&mut Vec<EndpointConstraint>,collect:bool,work:&mut usize)->Result<(),String>{
+                     parent:Option<RigidBodyHandle>,collider:ColliderHandle,up:Vec3,velocity:Vec3,reach:f64,best:&mut Option<Support>,constraints:&mut Vec<EndpointConstraint>,collect:bool,work:&mut usize)->Result<(),String>{
     *work+=1;if *work>16384{return Err("post-motion endpoint primitive cap".into());}
     if let Some(compound)=shape.as_compound(){
-        for (local,part) in compound.shapes(){primitive_support(region,own_shape,own_pose,part.as_ref(),&(*pose * *local),parent,up,velocity,reach,best,constraints,collect,work)?;}
+        for (local,part) in compound.shapes(){primitive_support(region,own_shape,own_pose,part.as_ref(),&(*pose * *local),parent,collider,up,velocity,reach,best,constraints,collect,work)?;}
         return Ok(());
     }
     let own=own_shape.as_cuboid().ok_or("unsupported endpoint actor primitive")?;
@@ -126,7 +135,7 @@ fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&d
         let point=*pose*contact.local_p2;
         let carrier=parent.map_or(Vec3::ZERO,|handle|region.sim.rigid_body_set[handle].velocity_at_point(point));
         if !point.is_finite()||!carrier.is_finite(){return Err("invalid endpoint carrier point velocity".into());}
-        if collect {if constraints.len()>=64{return Err("post-motion endpoint constraint cap".into());} constraints.push(EndpointConstraint {normal,carrier});}
+        if collect {if constraints.len()>=64{return Err("post-motion endpoint constraint cap".into());} constraints.push(EndpointConstraint {normal,carrier,collider});}
         if normal.dot(up)<0.5||(velocity-carrier).dot(normal)>0.02{continue;}
         let body=parent.and_then(|h|region.bodies.iter().find(|(_,value)|**value==h).map(|(id,_)|*id)).unwrap_or(0);
         let support=Support {normal,carrier,point,body,epoch:if body==0{0}else{region.body_epochs[&body]}};
@@ -148,7 +157,7 @@ fn endpoint(region:&Region,a:&Actor,up:Vec3,velocity:Vec3,collect:bool)->Result<
         let reach=0.003_f64.max(collider.contact_skin()+other.contact_skin())+1e-9;
         if !bounds.loosened(reach).intersects(&other.shape().compute_aabb(&actual)){continue;}
         candidates+=1;if candidates>64{return Err("post-motion endpoint candidate cap".into());}
-        primitive_support(region,collider.shape(),&pose,other.shape(),&actual,other.parent(),up,velocity,reach,&mut best,&mut constraints,collect,&mut work)?;
+        primitive_support(region,collider.shape(),&pose,other.shape(),&actual,other.parent(),handle,up,velocity,reach,&mut best,&mut constraints,collect,&mut work)?;
     }Ok((best,constraints))
 }
 /// A real endpoint can constrain motion without having generated a positive impulse
@@ -158,7 +167,21 @@ pub(super) fn controller_delta(region:&Region,a:&Actor,input:&Input,actual:Vec3,
     let (projected,rank)=terminal_projection(actual,drive,target,&input.events)?;
     let Some(rules)=&input.post_rules else{return Ok((projected,rank));};
     let (_,constraints)=endpoint(region,a,rules.up,actual,true)?;
-    let delta=endpoint_motor(actual,target-drive,&input.events,&constraints)?;
+    let requested=target-drive;let mut retained=Vec::new();let mut bounds=Vec::new();
+    for event in &input.events {
+        let normal=vector(event,12);
+        // A speculative solve can stop at contact while retaining inward motor speed.
+        // Its outward impulse is real and remains in the physical ledger. Permit only
+        // removal of the still-inward applied motor, toward relative rest, never beyond
+        // it. An opposing impulse remains a hard nullspace plane and blocks this change.
+        let cancellation=constraints.iter().filter(|c|{let (slot,generation)=c.collider.into_raw_parts();slot as i64==event[4]&&generation as i64==event[5]&&c.normal.dot(normal)>1.-1e-10})
+            .map(|c|(-(actual-c.carrier).dot(normal)).min(-(drive-c.carrier).dot(normal)).min(requested.dot(normal)))
+            .filter(|cap|*cap>1e-10).min_by(|a,b|a.total_cmp(b));
+        if let Some(cap)=cancellation {
+            bounds.push((normal,0.));bounds.push((-normal,-cap));
+        }else{retained.push(*event);}
+    }
+    let delta=endpoint_motor_bounded(actual,requested,&retained,&constraints,&bounds)?;
     if !(actual+delta).is_finite()||(actual+delta).length()>MAX_SPEED{return Err("endpoint controller plus retained response exceeds speed envelope".into());}
     Ok((delta,rank))
 }
