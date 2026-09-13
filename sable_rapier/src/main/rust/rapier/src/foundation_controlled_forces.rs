@@ -130,7 +130,7 @@ fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&d
     let normal=pose.rotation*manifold.local_n2;
     if !normal.is_finite()||(normal.length()-1.).abs()>1e-6{return Err("invalid endpoint normal".into());}
     for contact in &manifold.points {
-        if !contact.dist.is_finite()||contact.dist < -0.005{return Err("post-motion endpoint penetration exceeds physical bound".into());}
+        if !contact.dist.is_finite()||contact.dist < -0.005{return Err(format!("post-motion endpoint penetration exceeds physical bound: depth={} own={:?} other={:?} collider={:?}",contact.dist,own_pose,pose,collider));}
         if contact.dist>reach{continue;}
         let point=*pose*contact.local_p2;
         let carrier=parent.map_or(Vec3::ZERO,|handle|region.sim.rigid_body_set[handle].velocity_at_point(point));
