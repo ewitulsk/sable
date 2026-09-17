@@ -17,9 +17,9 @@ pub(super) fn prepare_item_drag(registry:&mut Registry,scene:i64,ids:&[i64],valu
     let mut receipt=ids[7..10].to_vec();receipt.extend(vector_bits(up));Ok(receipt)
 }
 pub(super) fn item_drag(region:&Region,a:&Actor,up:Vec3,velocity:Vec3)->Result<Vec3,String>{
-    let (support,_)=endpoint(region,a,up,velocity,false)?;
-    let carrier=support.map_or(Vec3::ZERO,|s|s.carrier);
-    let axis=support.map_or(up,|s|s.normal);
+    let (support,forces,_)=endpoint(region,a,up,velocity,false)?;
+    let carrier=forces.map_or(Vec3::ZERO,|s|s.carrier);
+    let axis=forces.map_or(up,|s|s.normal);
     let relative=velocity-carrier;let normal=axis*relative.dot(axis);
     let after=carrier+(relative-normal)*(if support.is_some(){0.588}else{0.98})+normal*0.98;
     if !after.is_finite()||after.length()>MAX_SPEED{return Err("item endpoint drag escaped admitted speed".into());}
@@ -49,7 +49,40 @@ pub(super) fn prepare(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64])
 #[derive(Clone,Copy)]
 struct Support { normal:Vec3,carrier:Vec3,point:Vec3,body:i64,epoch:i64 }
 #[derive(Clone,Copy)]
+struct SupportForces { normal:Vec3,carrier:Vec3 }
+#[derive(Clone,Copy)]
 struct EndpointConstraint { normal:Vec3,carrier:Vec3,collider:ColliderHandle }
+
+fn vector_order(left:Vec3,right:Vec3)->std::cmp::Ordering {
+    left.x.total_cmp(&right.x).then(left.y.total_cmp(&right.y)).then(left.z.total_cmp(&right.z))
+}
+fn support_order(left:&Support,right:&Support)->std::cmp::Ordering {
+    vector_order(left.normal,right.normal).then(left.body.cmp(&right.body)).then(left.epoch.cmp(&right.epoch))
+        .then(vector_order(left.point,right.point)).then(vector_order(left.carrier,right.carrier))
+}
+/// Resolve simultaneous resting faces into one force frame without inventing a contact
+/// for publication. The strongest real face retains provenance and its exact carrier.
+/// Fixed faces may aggregate with other fixed faces; moving faces may aggregate only
+/// within the same body ownership epoch. Equal-weight unique normals prevent repeated
+/// manifold points or broadphase enumeration order from biasing a voxel-corner axis.
+fn resolve_supports(mut supports:Vec<Support>,up:Vec3)->Result<Option<(Support,SupportForces)>,String>{
+    if supports.is_empty(){return Ok(None);}
+    supports.sort_by(support_order);
+    let primary=*supports.iter().max_by(|left,right|left.normal.dot(up).total_cmp(&right.normal.dot(up)).then(support_order(left,right))).unwrap();
+    let compatible=|candidate:&Support| (primary.body==0&&candidate.body==0)
+        ||(primary.body==candidate.body&&primary.epoch==candidate.epoch);
+    let mut unique:Vec<Vec3>=Vec::new();
+    for support in supports {
+        if !compatible(&support){continue;}
+        let length=support.normal.length();
+        if !length.is_finite()||length<1e-12{return Err("invalid endpoint support normal".into());}
+        let normal=support.normal/length;
+        if unique.iter().all(|existing|existing.dot(normal)<=1.-1e-10){unique.push(normal);}
+    }
+    let normal=unique.into_iter().fold(Vec3::ZERO,|sum,value|sum+value);let length=normal.length();
+    if !normal.is_finite()||length<1e-12{return Err("invalid aggregate endpoint support frame".into());}
+    Ok(Some((primary,SupportForces {normal:normal/length,carrier:primary.carrier})))
+}
 // Minimize change to the requested controller impulse, never project actual velocity.
 // The feasible origin guarantees that an existing solver response can remain untouched.
 // At most three independent active planes define the Euclidean projection in 3D.
@@ -111,10 +144,10 @@ fn endpoint_motor_bounded(actual:Vec3,requested:Vec3,events:&[[i64;16]],contacts
     Err("endpoint motor projection has no numerically verified solution".into())
 }
 fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&dyn Shape,pose:&Pose,
-                     parent:Option<RigidBodyHandle>,collider:ColliderHandle,up:Vec3,velocity:Vec3,reach:f64,best:&mut Option<Support>,constraints:&mut Vec<EndpointConstraint>,collect:bool,work:&mut usize)->Result<(),String>{
+                     parent:Option<RigidBodyHandle>,collider:ColliderHandle,up:Vec3,velocity:Vec3,reach:f64,supports:&mut Vec<Support>,constraints:&mut Vec<EndpointConstraint>,collect:bool,work:&mut usize)->Result<(),String>{
     *work+=1;if *work>16384{return Err("post-motion endpoint primitive cap".into());}
     if let Some(compound)=shape.as_compound(){
-        for (local,part) in compound.shapes(){primitive_support(region,own_shape,own_pose,part.as_ref(),&(*pose * *local),parent,collider,up,velocity,reach,best,constraints,collect,work)?;}
+        for (local,part) in compound.shapes(){primitive_support(region,own_shape,own_pose,part.as_ref(),&(*pose * *local),parent,collider,up,velocity,reach,supports,constraints,collect,work)?;}
         return Ok(());
     }
     let own=own_shape.as_cuboid().ok_or("unsupported endpoint actor primitive")?;
@@ -139,16 +172,16 @@ fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&d
         if normal.dot(up)<0.5||(velocity-carrier).dot(normal)>0.02{continue;}
         let body=parent.and_then(|h|region.bodies.iter().find(|(_,value)|**value==h).map(|(id,_)|*id)).unwrap_or(0);
         let support=Support {normal,carrier,point,body,epoch:if body==0{0}else{region.body_epochs[&body]}};
-        if best.as_ref().map_or(true,|current|normal.dot(up)>current.normal.dot(up)){*best=Some(support);}
+        supports.push(support);
     }
     Ok(())
 }
-fn endpoint(region:&Region,a:&Actor,up:Vec3,velocity:Vec3,collect:bool)->Result<(Option<Support>,Vec<EndpointConstraint>),String>{
+fn endpoint(region:&Region,a:&Actor,up:Vec3,velocity:Vec3,collect:bool)->Result<(Option<Support>,Option<SupportForces>,Vec<EndpointConstraint>),String>{
     let body=actor_body(region,a)?;if body.colliders().len()!=1{return Err("endpoint actor shape count changed".into());}
     if region.sim.collider_set.len()>8192{return Err("post-motion endpoint collider cap".into());}
     let own=body.colliders()[0];let collider=&region.sim.collider_set[own];
     let pose=*body.position()*collider.position_wrt_parent().ok_or("endpoint actor parent missing")?;
-    let bounds=collider.shape().compute_aabb(&pose);let mut candidates=0;let mut work=0;let mut best=None;let mut constraints=Vec::new();
+    let bounds=collider.shape().compute_aabb(&pose);let mut candidates=0;let mut work=0;let mut supports=Vec::new();let mut constraints=Vec::new();
     for (handle,other) in region.sim.collider_set.iter(){
         if handle==own||!other.is_enabled()||other.is_sensor()||!collider.collision_groups().test(other.collision_groups())||!collider.solver_groups().test(other.solver_groups()){continue;}
         let actual=other.parent().map_or(*other.position(),|h|*region.sim.rigid_body_set[h].position()*other.position_wrt_parent().unwrap());
@@ -157,8 +190,10 @@ fn endpoint(region:&Region,a:&Actor,up:Vec3,velocity:Vec3,collect:bool)->Result<
         let reach=0.003_f64.max(collider.contact_skin()+other.contact_skin())+1e-9;
         if !bounds.loosened(reach).intersects(&other.shape().compute_aabb(&actual)){continue;}
         candidates+=1;if candidates>64{return Err("post-motion endpoint candidate cap".into());}
-        primitive_support(region,collider.shape(),&pose,other.shape(),&actual,other.parent(),handle,up,velocity,reach,&mut best,&mut constraints,collect,&mut work)?;
-    }Ok((best,constraints))
+        primitive_support(region,collider.shape(),&pose,other.shape(),&actual,other.parent(),handle,up,velocity,reach,&mut supports,&mut constraints,collect,&mut work)?;
+    }
+    let resolved=resolve_supports(supports,up)?;
+    Ok((resolved.map(|value|value.0),resolved.map(|value|value.1),constraints))
 }
 /// A real endpoint can constrain motion without having generated a positive impulse
 /// (for example a stationary skin-distance floor). Constrain only the next motor delta;
@@ -166,7 +201,7 @@ fn endpoint(region:&Region,a:&Actor,up:Vec3,velocity:Vec3,collect:bool)->Result<
 pub(super) fn controller_delta(region:&Region,a:&Actor,input:&Input,actual:Vec3,drive:Vec3,target:Vec3)->Result<(Vec3,usize),String>{
     let (projected,rank)=terminal_projection(actual,drive,target,&input.events)?;
     let Some(rules)=&input.post_rules else{return Ok((projected,rank));};
-    let (_,constraints)=endpoint(region,a,rules.up,actual,true)?;
+    let (_,_,constraints)=endpoint(region,a,rules.up,actual,true)?;
     let requested=target-drive;let mut retained=Vec::new();let mut bounds=Vec::new();
     for event in &input.events {
         let normal=vector(event,12);
@@ -195,8 +230,8 @@ pub(super) fn complete(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64]
     let terminal=input.terminal.as_ref().ok_or("terminal motor must precede post-motion forces")?;
     let before=actor_body(region,a)?.linvel();
     if vector(terminal,26)!=before||vector(result,21)!=before{return Err("post-motion actual terminal velocity CAS mismatch".into());}
-    let (support,constraints)=endpoint(region,a,rules.up,before,rules.flight!=0)?;
-    let normal=support.map_or(Vec3::ZERO,|s|s.normal);let carrier=support.map_or(Vec3::ZERO,|s|s.carrier);
+    let (support,forces,constraints)=endpoint(region,a,rules.up,before,rules.flight!=0)?;
+    let normal=forces.map_or(Vec3::ZERO,|s|s.normal);let carrier=forces.map_or(Vec3::ZERO,|s|s.carrier);
     let gravity=if rules.flight==0{
         let inward=rules.acceleration.dot(normal);
         (if support.is_some()&&inward<0.{normal*inward}else{rules.acceleration})*0.05
@@ -212,7 +247,7 @@ pub(super) fn complete(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64]
     let after=dragged+flight;if !after.is_finite()||after.length()>MAX_SPEED{return Err("post-motion final velocity exceeds bound".into());}
     let next_mutation=region.mutation.checked_add(1).ok_or("post-motion mutation exhausted")?;
     let mut receipt=result[..14].to_vec();receipt.push(rules.flight);receipt.extend(vector_bits(rules.acceleration));receipt.extend(vector_bits(rules.up));receipt.push(bits(rules.component));
-    receipt.extend(vector_bits(before));receipt.push(support.is_some() as i64);receipt.extend(vector_bits(normal));receipt.extend(vector_bits(carrier));
+    receipt.extend(vector_bits(before));receipt.push(support.is_some() as i64);receipt.extend(vector_bits(support.map_or(Vec3::ZERO,|s|s.normal)));receipt.extend(vector_bits(support.map_or(Vec3::ZERO,|s|s.carrier)));
     receipt.extend([support.map_or(0,|s|s.body),support.map_or(0,|s|s.epoch)]);receipt.extend(vector_bits(support.map_or(Vec3::ZERO,|s|s.point)));
     receipt.extend(vector_bits(gravity));receipt.extend(vector_bits(dragged-accelerated));receipt.extend(vector_bits(flight));receipt.extend(vector_bits(after));
     let key=a.body;let region=registry.scenes.get_mut(&scene).unwrap();let body=&mut region.sim.rigid_body_set[region.bodies[&key]];
@@ -241,5 +276,87 @@ pub(super) fn landing(registry:&Registry,scene:i64,ids:&[i64],values:&[f64])->Re
     let speed=if rules.flight==0&&final_result[25]==1 {(-(rules.incoming-vector(final_result,29)).dot(vector(final_result,26))).max(0.)}else{0.};
     if !speed.is_finite(){return Err("controller landing relative speed invalid".into());}
     let mut out=result[..14].to_vec();out.extend(vector_bits(rules.incoming));out.push(bits(speed));Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn support(normal:Vec3,carrier:Vec3,body:i64)->Support {
+        Support {normal,carrier,point:normal*body as f64,body,epoch:body}
+    }
+    fn corner(order:[usize;3],up:Vec3)->(Support,SupportForces) {
+        let values=[
+            support(Vec3::X,Vec3::ZERO,0),
+            support(Vec3::Y,Vec3::ZERO,0),
+            support(Vec3::Z,Vec3::ZERO,0),
+        ];
+        resolve_supports(order.into_iter().map(|index|values[index]).collect(),up).unwrap().unwrap()
+    }
+
+    #[test]
+    fn corner_force_frame_is_enumeration_order_invariant() {
+        let up=Vec3::ONE.normalize();let expected=corner([0,1,2],up);
+        for order in [[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]] {
+            let actual=corner(order,up);
+            assert_eq!(actual.0.normal,expected.0.normal);
+            assert_eq!(actual.1.normal,expected.1.normal);
+            assert_eq!(actual.1.carrier,expected.1.carrier);
+        }
+        assert!(expected.1.normal.distance(up)<1e-12);
+        assert_eq!(expected.1.carrier,Vec3::ZERO);
+    }
+
+    #[test]
+    fn repeated_points_on_one_face_do_not_bias_corner_normal() {
+        let up=Vec3::ONE.normalize();
+        let values=vec![
+            support(Vec3::X,Vec3::ZERO,0),support(Vec3::X,Vec3::ZERO,0),support(Vec3::X,Vec3::ZERO,0),
+            support(Vec3::Y,Vec3::ZERO,0),support(Vec3::Z,Vec3::ZERO,0),
+        ];
+        let (_,forces)=resolve_supports(values,up).unwrap().unwrap();
+        assert!(forces.normal.distance(up)<1e-12);
+    }
+
+    #[test]
+    fn near_coplanar_normals_deduplicate_after_normalization() {
+        // Manifold normals are admitted within a small unit-length tolerance. Compare
+        // directions, not their raw magnitudes, exactly as the Java mirror does.
+        let almost_x=Vec3::new(0.9999996,0.000005,0.);
+        let (_,forces)=resolve_supports(vec![support(Vec3::X,Vec3::ZERO,0),support(almost_x,Vec3::ZERO,0)],Vec3::X).unwrap().unwrap();
+        assert!(forces.normal.distance(almost_x.normalize())<1e-12);
+
+        // Just outside the 1e-10 directional threshold remains a second plane even
+        // when its admitted raw magnitude would otherwise make the dot exceed one.
+        let direction=Vec3::new(1.,0.000021,0.).normalize();let scaled=direction*1.0000005;
+        let (_,forces)=resolve_supports(vec![support(Vec3::X,Vec3::ZERO,0),support(scaled,Vec3::ZERO,0)],Vec3::X).unwrap().unwrap();
+        assert!(forces.normal.distance((Vec3::X+direction).normalize())<1e-12);
+    }
+
+    #[test]
+    fn corner_force_frame_changes_continuously_across_primary_tie() {
+        let left=Vec3::new(0.999,1.,1.).normalize();let right=Vec3::new(1.001,1.,1.).normalize();
+        let a=corner([0,1,2],left);let b=corner([0,1,2],right);
+        assert_ne!(a.0.normal,b.0.normal,"the real strongest provenance face should cross the tie");
+        assert!(a.1.normal.distance(Vec3::ONE.normalize())<1e-12);
+        assert_eq!(a.1.normal,b.1.normal);
+    }
+
+    #[test]
+    fn unrelated_moving_supports_do_not_mix_material_frames() {
+        let up=Vec3::new(0.8,0.6,0.);let carrier=Vec3::ZERO;
+        let supports=vec![support(Vec3::X,carrier,1),support(Vec3::Y,Vec3::ZERO,2)];
+        let (primary,forces)=resolve_supports(supports,up).unwrap().unwrap();
+        assert_eq!(primary.body,1);assert_eq!(forces.normal,Vec3::X);assert_eq!(forces.carrier,carrier);
+    }
+
+    #[test]
+    fn one_moving_body_may_contribute_multiple_faces_without_averaging_carrier() {
+        let up=Vec3::new(0.8,0.6,0.);let carrier=Vec3::new(3.,0.,0.);
+        let mut x=support(Vec3::X,carrier,7);let mut y=support(Vec3::Y,Vec3::new(0.,4.,0.),7);x.epoch=9;y.epoch=9;
+        let (primary,forces)=resolve_supports(vec![y,x],up).unwrap().unwrap();
+        assert_eq!(primary.body,7);assert!(forces.normal.distance(Vec3::new(1.,1.,0.).normalize())<1e-12);
+        assert_eq!(forces.carrier,carrier);
+    }
 }
 
