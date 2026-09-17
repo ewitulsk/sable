@@ -83,6 +83,19 @@ fn resolve_supports(mut supports:Vec<Support>,up:Vec3)->Result<Option<(Support,S
     if !normal.is_finite()||length<1e-12{return Err("invalid aggregate endpoint support frame".into());}
     Ok(Some((primary,SupportForces {normal:normal/length,carrier:primary.carrier})))
 }
+fn resting_support(normal:Vec3,up:Vec3,witness:Vec3,carrier:Vec3)->bool {
+    normal.dot(up)>=0.5&&(witness-carrier).dot(normal)<=0.02
+}
+/// PLAYER grounding follows the final admitted path leg, not a retained solver response
+/// or the later terminal-controller velocity correction. Completion proves every segment
+/// executed through its exact end boundary before this witness can be consumed.
+fn player_support_witness(input:&Input)->Result<Vec3,String> {
+    let final_segment=input.segments.last().ok_or("player support requires a final admitted motor leg")?;
+    if !input.started||input.active_segment+1!=input.segments.len()||final_segment.end!=input.end {
+        return Err("player support requires the executed final motor leg".into());
+    }
+    Ok(final_segment.velocity)
+}
 // Minimize change to the requested controller impulse, never project actual velocity.
 // The feasible origin guarantees that an existing solver response can remain untouched.
 // At most three independent active planes define the Euclidean projection in 3D.
@@ -169,7 +182,7 @@ fn primitive_support(region:&Region,own_shape:&dyn Shape,own_pose:&Pose,shape:&d
         let carrier=parent.map_or(Vec3::ZERO,|handle|region.sim.rigid_body_set[handle].velocity_at_point(point));
         if !point.is_finite()||!carrier.is_finite(){return Err("invalid endpoint carrier point velocity".into());}
         if collect {if constraints.len()>=64{return Err("post-motion endpoint constraint cap".into());} constraints.push(EndpointConstraint {normal,carrier,collider});}
-        if normal.dot(up)<0.5||(velocity-carrier).dot(normal)>0.02{continue;}
+        if !resting_support(normal,up,velocity,carrier){continue;}
         let body=parent.and_then(|h|region.bodies.iter().find(|(_,value)|**value==h).map(|(id,_)|*id)).unwrap_or(0);
         let support=Support {normal,carrier,point,body,epoch:if body==0{0}else{region.body_epochs[&body]}};
         supports.push(support);
@@ -230,7 +243,8 @@ pub(super) fn complete(registry:&mut Registry,scene:i64,ids:&[i64],values:&[f64]
     let terminal=input.terminal.as_ref().ok_or("terminal motor must precede post-motion forces")?;
     let before=actor_body(region,a)?.linvel();
     if vector(terminal,26)!=before||vector(result,21)!=before{return Err("post-motion actual terminal velocity CAS mismatch".into());}
-    let (support,forces,constraints)=endpoint(region,a,rules.up,before,rules.flight!=0)?;
+    let support_witness=player_support_witness(input)?;
+    let (support,forces,constraints)=endpoint(region,a,rules.up,support_witness,rules.flight!=0)?;
     let normal=forces.map_or(Vec3::ZERO,|s|s.normal);let carrier=forces.map_or(Vec3::ZERO,|s|s.carrier);
     let gravity=if rules.flight==0{
         let inward=rules.acceleration.dot(normal);
@@ -293,6 +307,12 @@ mod tests {
         ];
         resolve_supports(order.into_iter().map(|index|values[index]).collect(),up).unwrap().unwrap()
     }
+    fn player_input(final_velocity:Vec3)->Input {
+        Input {sequence:1,start:0,end:50_000_000,velocity:final_velocity,started:true,initial_velocity:final_velocity,
+            segments:vec![MotorSegment {end:50_000_000,velocity:final_velocity}],active_segment:0,applied_motor_delta:Vec3::ZERO,
+            terminal:None,terminal_supported:true,post_rules:None,item_drag_up:None,final_receipt:None,
+            events:Vec::new(),impacts:Vec::new(),landing_impacts:Vec::new()}
+    }
 
     #[test]
     fn corner_force_frame_is_enumeration_order_invariant() {
@@ -331,6 +351,23 @@ mod tests {
         let direction=Vec3::new(1.,0.000021,0.).normalize();let scaled=direction*1.0000005;
         let (_,forces)=resolve_supports(vec![support(Vec3::X,Vec3::ZERO,0),support(scaled,Vec3::ZERO,0)],Vec3::X).unwrap().unwrap();
         assert!(forces.normal.distance((Vec3::X+direction).normalize())<1e-12);
+    }
+
+    #[test]
+    fn outward_solver_response_does_not_erase_resting_final_leg() {
+        let input=player_input(Vec3::new(2.,-1.,0.));let actual=Vec3::new(2.,4.,0.);
+        let witness=player_support_witness(&input).unwrap();
+        assert_eq!(witness,input.segments[0].velocity);
+        assert!(resting_support(Vec3::Y,Vec3::Y,witness,Vec3::ZERO));
+        assert!(!resting_support(Vec3::Y,Vec3::Y,actual,Vec3::ZERO));
+    }
+
+    #[test]
+    fn outward_final_leg_rejects_support_despite_inward_solver_velocity() {
+        let input=player_input(Vec3::new(2.,1.,0.));let actual=Vec3::new(2.,-4.,0.);
+        let witness=player_support_witness(&input).unwrap();
+        assert!(!resting_support(Vec3::Y,Vec3::Y,witness,Vec3::ZERO));
+        assert!(resting_support(Vec3::Y,Vec3::Y,actual,Vec3::ZERO));
     }
 
     #[test]
